@@ -47,3 +47,10 @@ build/
 dist/
 *.egg-info/
 .eggs/
+
+data_example/
+weight/
+output/
+
+# uv
+uv.lock

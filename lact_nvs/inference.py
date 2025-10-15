@@ -129,6 +129,7 @@ parser.add_argument("--config", type=str, default="config/lact_l24_d768_ttt2x.ya
 parser.add_argument("--load", type=str, default="weight/obj_res256.pt")
 parser.add_argument("--data_path", type=str, default="data_example/gso_sample_data_path.json")
 parser.add_argument("--output_dir", type=str, default="output/")
+parser.add_argument("--first_n", type=int, default=None)
 parser.add_argument("--num_all_views", type=int, default=32)
 
 parser.add_argument("--num_input_views", type=int, default=20)
@@ -172,6 +173,8 @@ dataloader = DataLoader(
 
 
 for sample_idx, data_dict in enumerate(dataloader):
+    if args.first_n is not None and sample_idx >= args.first_n:
+        break
     data_dict = {key: value.cuda() for key, value in data_dict.items() if isinstance(value, torch.Tensor)}
     if args.scene_inference:
         # Randomly select input views and use remaining as target
@@ -196,22 +199,34 @@ for sample_idx, data_dict in enumerate(dataloader):
         
         # Save rendered images if output directory is specified
         if output_dir:
-            def save_image_rgb(tensor, filepath):
-                """Save tensor as RGB image."""
+            def tensor_to_numpy(tensor):
+                """Convert tensor to numpy RGB image."""
                 numpy_image = tensor.permute(1, 2, 0).cpu().numpy()
                 numpy_image = np.clip(numpy_image * 255, 0, 255).astype(np.uint8)
-                Image.fromarray(numpy_image, mode='RGB').save(filepath)
+                return numpy_image
 
             batch_size, num_views = rendering.shape[:2]
             for batch_idx in range(batch_size):
+                # Collect all images for this batch
+                rendered_images = []
+                target_images = []
+                
                 for view_idx in range(num_views):
-                    # Save rendered and target images
-                    for img_type, img_tensor in [("rendered", rendering[batch_idx, view_idx]), 
-                                                 ("target", target[batch_idx, view_idx])]:
-                        filename = f"sample_{sample_idx:06d}_view_{view_idx:02d}_{img_type}.png"
-                        save_image_rgb(img_tensor, os.path.join(output_dir, filename))
+                    rendered_images.append(tensor_to_numpy(rendering[batch_idx, view_idx]))
+                    target_images.append(tensor_to_numpy(target[batch_idx, view_idx]))
+                
+                # Concatenate images horizontally (all views side by side)
+                target_row = np.concatenate(target_images, axis=1)
+                rendered_row = np.concatenate(rendered_images, axis=1)
+                
+                # Stack rendered and target rows vertically
+                combined_image = np.concatenate([target_row, rendered_row], axis=0)
+                
+                # Save the concatenated image
+                filename = f"sample_{sample_idx:06d}_batch_{batch_idx:02d}.png"
+                Image.fromarray(combined_image).save(os.path.join(output_dir, filename))
             
-            print(f"Saved images for sample {sample_idx} to {output_dir}")
+            print(f"Saved concatenated image for sample {sample_idx} to {output_dir}")
         
         # Rendering a video to circularly rotate the camera views
         if args.scene_inference:
@@ -238,6 +253,3 @@ for sample_idx, data_dict in enumerate(dataloader):
         frames = (rendering[0].permute(0, 2, 3, 1).cpu().numpy() * 255).astype(np.uint8)
         imageio.mimsave(video_path, frames, fps=30, quality=8)
         print(f"Saved turntable video to {video_path}")
-
-            
-                
