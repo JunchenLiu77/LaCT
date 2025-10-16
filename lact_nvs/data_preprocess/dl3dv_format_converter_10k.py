@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 """
+Modified from dl3dv_format_converter.py
 DL3DV Format Converter
 
 This script converts DL3DV benchmark data to the standard format used by LaCT NVS.
@@ -44,9 +45,9 @@ def process_one_scene(scene_path, output_dir=None):
     scene_name = scene_path.name
     
     # Read transforms.json
-    json_file = scene_path / 'nerfstudio' / 'transforms.json'
+    json_file = scene_path / 'transforms.json'
     if not json_file.exists():
-        print(f"Warning: transforms.json not found in {scene_path / 'nerfstudio'}")
+        print(f"Warning: transforms.json not found in {scene_path}")
         return False
     
     json_data = json.load(open(json_file, 'r'))
@@ -77,10 +78,10 @@ def process_one_scene(scene_path, output_dir=None):
 
     for i in range(num_frames):
         frame = json_data['frames'][i]
-        file_path = 'images_4/' + frame['file_path'].split('/')[-1]
+        file_path = 'images_8/' + frame['file_path'].split('/')[-1]
 
         # Load and undistort image
-        image_path = scene_path / 'nerfstudio' / file_path
+        image_path = scene_path / file_path
         if not image_path.exists():
             print(f"Warning: Image not found: {image_path}")
             continue
@@ -134,31 +135,30 @@ def convert_folder(folder_path, output_dir=None):
     Convert a single DL3DV folder to standard format.
     
     Args:
-        folder_path: Path to the folder containing nerfstudio/ subfolder
+        folder_path: Path to the folder containing subfolder
         output_dir: Optional output directory (if None, uses folder_path)
     """
     folder_path = Path(folder_path)
-    nerfstudio_path = folder_path / 'nerfstudio'
     
-    if not nerfstudio_path.exists():
-        print(f"Warning: nerfstudio folder not found in {folder_path}")
+    if not folder_path.exists():
+        print(f"Warning: folder not found in {folder_path}")
         return False
     
     # Process the scene following process_dl3dv.py rules
     success = process_one_scene(folder_path, output_dir)
     
     if success and output_dir is None:
-        # If processing in-place, also move images_4 to images
-        images_4_path = nerfstudio_path / 'images_4'
+        # If processing in-place, also move images_8 to images
+        images_8_path = folder_path / 'images_8'
         images_path = folder_path / 'images'
         
-        if images_4_path.exists():
+        if images_8_path.exists():
             if images_path.exists():
                 shutil.rmtree(images_path)
-            shutil.move(str(images_4_path), str(images_path))
+            shutil.move(str(images_8_path), str(images_path))
         
-        # Remove nerfstudio folder
-        shutil.rmtree(nerfstudio_path)
+        # Remove folder
+        shutil.rmtree(folder_path)
     
     return success
 
@@ -199,12 +199,12 @@ def main():
     # Define paths
     current_dir = Path(__file__).parent
     data_example_dir = current_dir.parent / 'data_example'
-    benchmark_dir = data_example_dir / 'dl3dv_benchmark'
-    output_json = data_example_dir / 'dl3dv_benchmark_sample_data_path.json'
+    benchmark_dir = data_example_dir / 'dl3dv_10k/3K'
+    output_json = data_example_dir / 'dl3dv_10k_sample_data_path.json'
     
     # Optional: Define different input and output directories
     input_dir = benchmark_dir  # Can be changed to different input directory
-    output_base_dir = data_example_dir / 'dl3dv_benchmark_processed'  # Different output directory
+    output_base_dir = data_example_dir / 'dl3dv_10k_processed'  # Different output directory
     
     if not input_dir.exists():
         print(f"Error: {input_dir} does not exist")
