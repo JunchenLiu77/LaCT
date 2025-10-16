@@ -181,7 +181,7 @@ def create_sample_data_path_json(benchmark_dir, output_file):
             cameras_file = item / 'opencv_cameras.json'
             if cameras_file.exists():
                 # Create relative path from data_example
-                relative_path = f"dl3dv_processed/{item.name}/opencv_cameras.json"
+                relative_path = f"dl3dv_benchmark_processed/{item.name}/opencv_cameras.json"
                 data_paths.append(relative_path)
     
     # Sort for consistent output
