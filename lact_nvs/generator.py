@@ -23,7 +23,6 @@ import argparse
 import os
 from datetime import datetime
 
-
 class Generator:
     def __init__(self):
         self.model_config = {
@@ -31,7 +30,6 @@ class Generator:
             'lact_l24_d768_ttt2x': 'config/lact_l24_d768_ttt2x.yaml',
             'lact_l24_d768_ttt4x': 'config/lact_l24_d768_ttt4x.yaml',
         }
-        
         # Default SLURM settings
         self.slurm_defaults = {
             'job_name': 'lact',
@@ -40,12 +38,11 @@ class Generator:
             'nodes': 1,
             'mem': '48GB',
             'cpus_per_task': 8,
-            'gpus_per_node': 'l40s:2',
+            'gpu_count': 2,
+            'gpu_type': 'l40s',
         }
         
     def generate_script(self, args):
-        """Generate the complete SLURM script"""
-        
         # Generate output directory
         if args.expname is not None:
             exp_name = args.expname
@@ -53,225 +50,163 @@ class Generator:
             timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
             model_name = args.config.replace('config/', '').replace('.yaml', '')
             exp_name = f"{model_name}_{timestamp}"
-        
-        if args.inference:
-            output_dir = args.output_dir if args.output_dir else f"output/{exp_name}"
-        else:
-            output_dir = f"output/{exp_name}"
-        
+        output_dir = f"output/{exp_name}"
         script_path = f"{output_dir}/run.sh"
-        
-        # Determine config file
         if args.config in self.model_config:
             config_file = self.model_config[args.config]
         else:
             config_file = args.config
-        
-        # Build command line arguments
-        cmd_args = self._build_cmd_args(args, config_file, output_dir)
-        
-        # Generate the script content
-        script_content = self._generate_slurm_script(
-            args, config_file, cmd_args, output_dir
-        )
-        
-        # Save the script
-        os.makedirs(output_dir, exist_ok=True)
-        
-        with open(script_path, 'w') as f:
-            f.write(script_content)
-        
-        # Make it executable
-        os.chmod(script_path, 0o755)
-        
-        return script_path
-    
-    def _build_cmd_args(self, args, config_file, output_dir):
-        """Build command line arguments"""
-        cmd_args = []
-        
-        # Config file
-        cmd_args.append(f'--config {config_file}')
-        
+
+        # Prepare command argument string for training/inference
         if args.inference:
-            # Inference arguments
+            # inference command line
+            cmd = f"python inference.py --config {config_file}"
             if args.load:
-                cmd_args.append(f'--load {args.load}')
+                cmd += f" --load {args.load}"
             if args.data_path:
-                cmd_args.append(f'--data_path {args.data_path}')
-            if args.output_dir or output_dir:
-                cmd_args.append(f'--output_dir {output_dir}')
+                cmd += f" --data_path {args.data_path}"
+            if args.expname:
+                cmd += f" --expname {args.expname}"
             if args.num_all_views is not None:
-                cmd_args.append(f'--num_all_views {args.num_all_views}')
+                cmd += f" --num_all_views {args.num_all_views}"
             if args.num_input_views is not None:
-                cmd_args.append(f'--num_input_views {args.num_input_views}')
+                cmd += f" --num_input_views {args.num_input_views}"
             if args.num_target_views is not None:
-                cmd_args.append(f'--num_target_views {args.num_target_views}')
+                cmd += f" --num_target_views {args.num_target_views}"
             if args.scene_inference:
-                cmd_args.append('--scene_inference')
+                cmd += " --scene_inference"
             if args.image_size is not None:
-                cmd_args.append(f'--image_size {args.image_size[0]} {args.image_size[1]}')
+                cmd += f" --image_size {args.image_size[0]} {args.image_size[1]}"
             if args.first_n is not None:
-                cmd_args.append(f'--first_n {args.first_n}')
+                cmd += f" --first_n {args.first_n}"
+            run_cmd = f"srun --time {args.time or self.slurm_defaults['time']} uv run {cmd}"
         else:
-            # Training arguments
-            cmd_args.append(f'--expname {args.expname if args.expname else output_dir.split("/")[-1]}')
-            
+            # training: torchrun \ --nproc_per_node=2 \ --standalone \ train.py --config ... [other args]
+            gpus = args.gpus if args.gpus is not None else 2
+            base = f"torchrun --nproc_per_node={gpus} --standalone train.py --config {config_file}"
+            # Add remaining training CLI options
+            if args.expname:
+                base += f" --expname {args.expname}"
             if args.data_path:
-                cmd_args.append(f'--data_path {args.data_path}')
+                base += f" --data_path {args.data_path}"
             if args.load:
-                cmd_args.append(f'--load {args.load}')
+                base += f" --load {args.load}"
             if args.save_every is not None:
-                cmd_args.append(f'--save_every {args.save_every}')
+                base += f" --save_every {args.save_every}"
             if args.log_every is not None:
-                cmd_args.append(f'--log_every {args.log_every}')
+                base += f" --log_every {args.log_every}"
             if args.compile:
-                cmd_args.append('--compile')
+                base += " --compile"
             if args.actckpt:
-                cmd_args.append('--actckpt')
+                base += " --actckpt"
             if args.bs_per_gpu is not None:
-                cmd_args.append(f'--bs_per_gpu {args.bs_per_gpu}')
+                base += f" --bs_per_gpu {args.bs_per_gpu}"
             if args.num_all_views is not None:
-                cmd_args.append(f'--num_all_views {args.num_all_views}')
+                base += f" --num_all_views {args.num_all_views}"
             if args.num_input_views is not None:
-                cmd_args.append(f'--num_input_views {args.num_input_views}')
+                base += f" --num_input_views {args.num_input_views}"
             if args.num_target_views is not None:
-                cmd_args.append(f'--num_target_views {args.num_target_views}')
+                base += f" --num_target_views {args.num_target_views}"
             if args.image_size is not None:
-                cmd_args.append(f'--image_size {args.image_size[0]} {args.image_size[1]}')
+                base += f" --image_size {args.image_size[0]} {args.image_size[1]}"
             if args.scene_pose_normalize:
-                cmd_args.append('--scene_pose_normalize')
+                base += " --scene_pose_normalize"
             if args.lr is not None:
-                cmd_args.append(f'--lr {args.lr}')
+                base += f" --lr {args.lr}"
             if args.warmup is not None:
-                cmd_args.append(f'--warmup {args.warmup}')
+                base += f" --warmup {args.warmup}"
             if args.steps is not None:
-                cmd_args.append(f'--steps {args.steps}')
+                base += f" --steps {args.steps}"
             if args.weight_decay is not None:
-                cmd_args.append(f'--weight_decay {args.weight_decay}')
+                base += f" --weight_decay {args.weight_decay}"
             if args.lpips_start is not None:
-                cmd_args.append(f'--lpips_start {args.lpips_start}')
-        
-        return cmd_args
-    
-    def _generate_slurm_script(self, args, config_file, cmd_args, output_dir):
-        """Generate the complete SLURM script content"""
-        
-        # Update SLURM settings based on arguments
+                base += f" --lpips_start {args.lpips_start}"
+            if args.test_every is not None:
+                base += f" --test_every {args.test_every}"
+            if args.scene_inference:
+                base += " --scene_inference"
+            if args.first_n is not None:
+                base += f" --first_n {args.first_n}"
+            run_cmd = f"srun --time {args.time or self.slurm_defaults['time']} uv run {base}"
+
+        # Generate the script content
         slurm = self.slurm_defaults.copy()
         if args.time is not None:
             slurm['time'] = args.time
         if args.nodes is not None:
             slurm['nodes'] = args.nodes
         if args.gpus is not None:
-            slurm['gpus_per_node'] = f'l40s:{args.gpus}'
+            slurm['gpu_count'] = args.gpus
+        if args.gpu_type is not None:
+            slurm['gpu_type'] = args.gpu_type
         if args.memory is not None:
             slurm['mem'] = args.memory
-        
-        # Determine which Python script to use
-        python_script = 'inference.py' if args.inference else 'train.py'
-        
-        # Build the command arguments string
-        cmd_args_str = ' \\\n    '.join(cmd_args) if cmd_args else ''
-        if cmd_args_str:
-            cmd_args_str = ' \\\n    ' + cmd_args_str
-        
-        # Generate the script
-        script_parts = []
-        script_parts.append('#!/bin/bash')
-        script_parts.append(f'#SBATCH --job-name={slurm["job_name"]}')
-        script_parts.append(f'#SBATCH --account={slurm["account"]}')
-        script_parts.append(f'#SBATCH --output={output_dir}/%x_%j.out')
-        script_parts.append(f'#SBATCH --error={output_dir}/%x_%j.err')
-        script_parts.append(f'#SBATCH --time={slurm["time"]}')
-        script_parts.append(f'#SBATCH --nodes={slurm["nodes"]}')
-        script_parts.append(f'#SBATCH --mem={slurm["mem"]}')
-        script_parts.append(f'#SBATCH --cpus-per-task={slurm["cpus_per_task"]}')
-        script_parts.append(f'#SBATCH --gpus-per-node={slurm["gpus_per_node"]}')
-        script_parts.append('#SBATCH --ntasks-per-node=1')
-        script_parts.append('')
-        
-        script_parts.append(f'# Generated by generator.py on {datetime.now().strftime("%Y-%m-%d %H:%M:%S")}')
-        script_parts.append(f'# Config: {config_file}')
-        script_parts.append(f'# Mode: {"Inference" if args.inference else "Training"}')
-        script_parts.append('')
-        
-        script_parts.append('echo "=============================================="')
-        script_parts.append(f'echo "LaCT {"Inference" if args.inference else "Training"}"')
-        script_parts.append('echo "=============================================="')
-        script_parts.append('echo "Job ID: $SLURM_JOB_ID"')
-        script_parts.append('echo "Node: $SLURMD_NODENAME"')
-        script_parts.append(f'echo "GPUs: {args.gpus or 2}x L40s"')
-        script_parts.append('echo "Start time: $(date)"')
-        script_parts.append(f'echo "Config: {config_file}"')
-        script_parts.append('echo "=============================================="')
-        script_parts.append('')
-        
-        script_parts.append('# Load modules')
-        script_parts.append('module load python/3.12')
-        script_parts.append('module load StdEnv/2023 intel/2023.2.1')
-        script_parts.append('module load cuda/11.8')
-        script_parts.append('')
-        
-        script_parts.append('# Environment variables')
-        script_parts.append('export OMP_NUM_THREADS=4')
-        script_parts.append('export IBV_FORK_SAFE=1')
-        script_parts.append('export MASTER_ADDR=localhost')
-        script_parts.append('export MASTER_PORT=$(shuf -i 20000-65000 -n 1)')
-        script_parts.append('')
-        
-        script_parts.append('# Optimized NCCL settings')
-        script_parts.append('# export NCCL_IB_DISABLE=1  # Uncomment to disable InfiniBand')
-        script_parts.append('# export NCCL_P2P_DISABLE=1  # Uncomment to disable P2P')
-        script_parts.append('')
-        
-        script_parts.append('# Debug settings (optional)')
-        script_parts.append('# export NCCL_DEBUG=INFO')
-        script_parts.append('# export CUDA_LAUNCH_BLOCKING=1')
-        script_parts.append('')
-        
-        script_parts.append('# Suppress libibverbs warnings')
-        script_parts.append('exec 3>&2')
-        script_parts.append('exec 2> >(grep -v "libibverbs: Warning" >&3)')
-        script_parts.append('')
-        
-        script_parts.append('echo')
-        script_parts.append(f'echo "Starting {"inference" if args.inference else "training"}..."')
-        script_parts.append('echo "Command arguments:"')
-        
-        # Add command arguments display
-        for arg in cmd_args:
-            script_parts.append(f'echo "  {arg}"')
-        
-        script_parts.append('echo')
-        script_parts.append('')
-        script_parts.append(f'# Run the {"inference" if args.inference else "training"}')
-        
-        if args.inference:
-            # Inference doesn't use torchrun
-            script_parts.append(f'srun --time {slurm["time"]} uv run python {python_script}{cmd_args_str}')
-        else:
-            # Training uses torchrun
-            script_parts.append(f'srun --time {slurm["time"]} uv run torchrun \\')
-            script_parts.append(f'    --nproc_per_node={args.gpus or 2} \\')
-            script_parts.append(f'    --master_addr=$MASTER_ADDR \\')
-            script_parts.append(f'    --master_port=$MASTER_PORT \\')
-            script_parts.append(f'    {python_script}{cmd_args_str}')
-        
-        script_parts.append('')
-        script_parts.append('# Restore stderr')
-        script_parts.append('exec 2>&3')
-        script_parts.append('exec 3>&-')
-        script_parts.append('')
-        script_parts.append('echo')
-        script_parts.append('echo "=============================================="')
-        script_parts.append(f'echo "{"Inference" if args.inference else "Training"} completed at: $(date)"')
-        script_parts.append('echo "=============================================="')
-        script_parts.append('')
-        script_parts.append('exit 0')
-        
-        return '\n'.join(script_parts)
 
+        script_lines = [
+            "#!/bin/bash",
+            f"#SBATCH --job-name={slurm['job_name']}",
+            f"#SBATCH --account={slurm['account']}",
+            f"#SBATCH --output={output_dir}/%x_%j.out",
+            f"#SBATCH --error={output_dir}/%x_%j.err",
+            f"#SBATCH --time={slurm['time']}",
+            f"#SBATCH --nodes={slurm['nodes']}",
+            f"#SBATCH --mem={slurm['mem']}",
+            f"#SBATCH --cpus-per-task={slurm['cpus_per_task']}",
+            f"#SBATCH --gpus-per-node={slurm['gpu_type']}:{slurm['gpu_count']}",
+            "#SBATCH --ntasks-per-node=1",
+            "",
+            f"# Generated by generator.py on {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}",
+            f"# Config: {config_file}",
+            f"# Mode: {'Inference' if args.inference else 'Training'}",
+            "",
+            "echo \"==============================================\"",
+            f"echo \"LaCT {'Inference' if args.inference else 'Training'}\"",
+            "echo \"==============================================\"",
+            "echo \"Job ID: $SLURM_JOB_ID\"",
+            "echo \"Node: $SLURMD_NODENAME\"",
+            f"echo \"GPUs: {slurm['gpu_count']}x {slurm['gpu_type']}\"",
+            "echo \"Start time: $(date)\"",
+            f"echo \"Config: {config_file}\"",
+            "echo \"==============================================\"",
+            "",
+            "# Load modules",
+            "module load python/3.12",
+            "module load StdEnv/2023 intel/2023.2.1",
+            "module load cuda/11.8",
+            "",
+            "# Environment variables",
+            "export OMP_NUM_THREADS={slurm['cpus_per_task']/slurm['gpu_count']}",
+            "export IBV_FORK_SAFE=1",
+            "",
+            "# Suppress libibverbs warnings",
+            "exec 3>&2",
+            "exec 2> >(grep -v \"libibverbs: Warning\" >&3)",
+            "",
+            "echo",
+            f"echo \"Starting {'inference' if args.inference else 'training'}...\"",
+            "echo \"Command line:\"",
+            f"echo '{run_cmd}'",
+            "echo",
+            "",
+            "# Run the job",
+            run_cmd,
+            "",
+            "# Restore stderr",
+            "exec 2>&3",
+            "exec 3>&-",
+            "",
+            "echo",
+            "echo \"==============================================\"",
+            f"echo \"{'Inference' if args.inference else 'Training'} completed at: $(date)\"",
+            "echo \"==============================================\"",
+            "",
+            "exit 0"
+        ]
+        os.makedirs(output_dir, exist_ok=True)
+        with open(script_path, 'w') as f:
+            f.write('\n'.join(script_lines))
+        os.chmod(script_path, 0o755)
+        return script_path
 
 def main():
     parser = argparse.ArgumentParser(
@@ -290,6 +225,8 @@ def main():
                         help='Generate inference script instead of training')
     
     # Common arguments (both training and inference)
+    parser.add_argument('--expname', type=str,
+                        help='Experiment name')
     parser.add_argument('--load', type=str,
                         help='Checkpoint path to load')
     parser.add_argument('--data-path', type=str,
@@ -302,10 +239,12 @@ def main():
                         help='Number of target views')
     parser.add_argument('--image-size', nargs=2, type=int,
                         help='Image size [H W]')
+    parser.add_argument('--scene-inference', action='store_true',
+                        help='Use scene inference mode')
+    parser.add_argument('--first-n', type=int,
+                        help='First N samples to process')
     
     # Training-only arguments
-    parser.add_argument('--expname', type=str,
-                        help='Experiment name (training only)')
     parser.add_argument('--save-every', type=int,
                         help='Save checkpoint every N iterations')
     parser.add_argument('--log-every', type=int,
@@ -328,14 +267,8 @@ def main():
                         help='Weight decay')
     parser.add_argument('--lpips-start', type=int,
                         help='Iteration to start LPIPS loss')
-    
-    # Inference-only arguments
-    parser.add_argument('--output-dir', type=str,
-                        help='Output directory for inference results')
-    parser.add_argument('--scene-inference', action='store_true',
-                        help='Use scene inference mode')
-    parser.add_argument('--first-n', type=int,
-                        help='First N samples to process')
+    parser.add_argument('--test-every', type=int,
+                        help='Test every N iterations')
     
     # SLURM configuration
     parser.add_argument('--time', type=str,
@@ -344,6 +277,8 @@ def main():
                         help='Number of nodes')
     parser.add_argument('--gpus', type=int,
                         help='Number of GPUs per node')
+    parser.add_argument('--gpu-type', type=str,
+                        help='GPU type')
     parser.add_argument('--memory', type=str,
                         help='Memory allocation (e.g., 48GB)')
     
@@ -354,23 +289,18 @@ def main():
                         help='Submit the job immediately after generation')
     
     args = parser.parse_args()
-    
-    # Generate the script
     generator = Generator()
     script_path = generator.generate_script(args)
-    
     print(f"Generated script: {script_path}")
-    
     if args.dry_run:
         print("\n--- Script Content ---")
         with open(script_path, 'r') as f:
             print(f.read())
-        os.remove(script_path)  # Clean up in dry-run mode
+        os.remove(script_path)
         try:
-            os.rmdir(os.path.dirname(script_path))  # Remove empty dir
+            os.rmdir(os.path.dirname(script_path))
         except OSError:
-            pass  # Directory not empty, that's fine
-    
+            pass
     if args.submit and not args.dry_run:
         print(f"Submitting job...")
         os.system(f"sbatch {script_path}")

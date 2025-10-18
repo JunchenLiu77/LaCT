@@ -52,5 +52,8 @@ data_example/
 weight/
 output/
 
+# wandb
+wandb/
+
 # uv
 uv.lock

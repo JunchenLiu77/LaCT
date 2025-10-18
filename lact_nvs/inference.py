@@ -122,134 +122,134 @@ def get_interpolated_cameras(
     }
 
 
+def main():
+    parser = argparse.ArgumentParser()
+    # Basic info
+    parser.add_argument("--config", type=str, default="config/lact_l24_d768_ttt2x.yaml")
+    parser.add_argument("--load", type=str, default="weight/obj_res256.pt")
+    parser.add_argument("--data_path", type=str, default="data_example/gso_sample_data_path.json")
+    parser.add_argument("--expname", type=str, default="default")
 
-parser = argparse.ArgumentParser()
-# Basic info
-parser.add_argument("--config", type=str, default="config/lact_l24_d768_ttt2x.yaml")
-parser.add_argument("--load", type=str, default="weight/obj_res256.pt")
-parser.add_argument("--data_path", type=str, default="data_example/gso_sample_data_path.json")
-parser.add_argument("--output_dir", type=str, default="output/")
-parser.add_argument("--first_n", type=int, default=None)
-parser.add_argument("--num_all_views", type=int, default=32)
+    parser.add_argument("--first_n", type=int, default=None)
+    parser.add_argument("--num_all_views", type=int, default=32)
+    parser.add_argument("--num_input_views", type=int, default=20)
+    parser.add_argument("--num_target_views", type=int, default=None)
+    parser.add_argument("--scene_inference", action="store_true")
+    parser.add_argument("--image_size", nargs=2, type=int, default=[256, 256], help="Image size H, W")
 
-parser.add_argument("--num_input_views", type=int, default=20)
-parser.add_argument("--num_target_views", type=int, default=None)
-parser.add_argument("--scene_inference", action="store_true")
-parser.add_argument("--image_size", nargs=2, type=int, default=[256, 256], help="Image size H, W")
-
-args = parser.parse_args()
-if args.num_target_views is None:
-    args.num_target_views = args.num_all_views - args.num_input_views
-model_config = omegaconf.OmegaConf.load(args.config)
-output_dir = args.output_dir
-os.makedirs(output_dir, exist_ok=True)
-
-# Create output directory if specified
-if output_dir:
+    args = parser.parse_args()
+    if args.num_target_views is None:
+        args.num_target_views = args.num_all_views - args.num_input_views
+    model_config = omegaconf.OmegaConf.load(args.config)
+    output_dir = f"output/{args.expname}"
     os.makedirs(output_dir, exist_ok=True)
+    print(f"Output directory: {output_dir}")
 
-# Seed everything
-seed = 95
-torch.manual_seed(seed)
-np.random.seed(seed)
-random.seed(seed)
-model = LaCTLVSM(**model_config).cuda()
+    # Seed everything
+    seed = 95
+    torch.manual_seed(seed)
+    np.random.seed(seed)
+    random.seed(seed)
+    model = LaCTLVSM(**model_config).cuda()
 
-# Load checkpoint
-print(f"Loading checkpoint from {args.load}...")
-checkpoint = torch.load(args.load, map_location="cpu")
-model.load_state_dict(checkpoint["model"])
+    # Load checkpoint
+    print(f"Loading checkpoint from {args.load}...")
+    checkpoint = torch.load(args.load, map_location="cpu")
+    model.load_state_dict(checkpoint["model"])
 
-# Data
-dataset = NVSDataset(args.data_path, args.num_all_views, tuple(args.image_size), sorted_indices=args.scene_inference, scene_pose_normalize=args.scene_inference)
-dataloader_seed_generator = torch.Generator()
-dataloader_seed_generator.manual_seed(seed)
-dataloader = DataLoader(
-    dataset,
-    batch_size=1,
-    shuffle=False,
-    generator=dataloader_seed_generator,    # This ensures deterministic dataloader
-)
+    # Data
+    dataset = NVSDataset(args.data_path, args.num_all_views, tuple(args.image_size), sorted_indices=args.scene_inference, scene_pose_normalize=args.scene_inference)
+    dataloader_seed_generator = torch.Generator()
+    dataloader_seed_generator.manual_seed(seed)
+    dataloader = DataLoader(
+        dataset,
+        batch_size=1,
+        shuffle=False,
+        generator=dataloader_seed_generator,    # This ensures deterministic dataloader
+    )
 
 
-for sample_idx, data_dict in enumerate(dataloader):
-    if args.first_n is not None and sample_idx >= args.first_n:
-        break
-    data_dict = {key: value.cuda() for key, value in data_dict.items() if isinstance(value, torch.Tensor)}
-    if args.scene_inference:
-        # Randomly select input views and use remaining as target
-        total_views = data_dict["image"].shape[1]
-        all_indices = torch.randperm(total_views)
-        input_indices = torch.sort(all_indices[:args.num_input_views])[0]   # Sort for video rendering only; model forward is permutation-invariant
-        target_indices = all_indices[-args.num_target_views:]
-        
-        input_data_dict = {key: value[:, input_indices] for key, value in data_dict.items()}
-        target_data_dict = {key: value[:, target_indices] for key, value in data_dict.items()}
-    else:
-        input_data_dict = {key: value[:, :args.num_input_views] for key, value in data_dict.items()}
-        target_data_dict = {key: value[:, -args.num_target_views:] for key, value in data_dict.items()}
-
-    with torch.autocast(dtype=torch.bfloat16, device_type="cuda", enabled=True) and torch.no_grad():
-        rendering = model(input_data_dict, target_data_dict)
-
-        target = target_data_dict["image"]
-        psnr = -10.0 * torch.log10(F.mse_loss(rendering, target)).item()
-
-        print(f"Sample {sample_idx}: PSNR = {psnr:.2f}")
-        
-        # Save rendered images if output directory is specified
-        if output_dir:
-            def tensor_to_numpy(tensor):
-                """Convert tensor to numpy RGB image."""
-                numpy_image = tensor.permute(1, 2, 0).cpu().numpy()
-                numpy_image = np.clip(numpy_image * 255, 0, 255).astype(np.uint8)
-                return numpy_image
-
-            batch_size, num_views = rendering.shape[:2]
-            for batch_idx in range(batch_size):
-                # Collect all images for this batch
-                rendered_images = []
-                target_images = []
-                
-                for view_idx in range(num_views):
-                    rendered_images.append(tensor_to_numpy(rendering[batch_idx, view_idx]))
-                    target_images.append(tensor_to_numpy(target[batch_idx, view_idx]))
-                
-                # Concatenate images horizontally (all views side by side)
-                target_row = np.concatenate(target_images, axis=1)
-                rendered_row = np.concatenate(rendered_images, axis=1)
-                
-                # Stack rendered and target rows vertically
-                combined_image = np.concatenate([target_row, rendered_row], axis=0)
-                
-                # Save the concatenated image
-                filename = f"sample_{sample_idx:06d}_batch_{batch_idx:02d}.png"
-                Image.fromarray(combined_image).save(os.path.join(output_dir, filename))
-            
-            print(f"Saved concatenated image for sample {sample_idx} to {output_dir}")
-        
-        # Rendering a video to circularly rotate the camera views
+    for sample_idx, data_dict in enumerate(dataloader):
+        if args.first_n is not None and sample_idx >= args.first_n:
+            break
+        data_dict = {key: value.cuda() for key, value in data_dict.items() if isinstance(value, torch.Tensor)}
         if args.scene_inference:
-            target_cameras = get_interpolated_cameras(
-                cameras=input_data_dict,
-                num_views=2,
-            )
+            # Randomly select input views and use remaining as target
+            total_views = data_dict["image"].shape[1]
+            all_indices = torch.randperm(total_views)
+            input_indices = torch.sort(all_indices[:args.num_input_views])[0]   # Sort for video rendering only; model forward is permutation-invariant
+            target_indices = all_indices[-args.num_target_views:]
+            
+            input_data_dict = {key: value[:, input_indices] for key, value in data_dict.items()}
+            target_data_dict = {key: value[:, target_indices] for key, value in data_dict.items()}
         else:
-            target_cameras = get_turntable_cameras_with_zoom_in(
-                batch_size=1,
-                num_views=120,
-                w=args.image_size[0],
-                h=args.image_size[1],
-                min_radius=1.7,
-                max_radius=3.0,
-                elevation=30,
-                up_vector=np.array([0, 0, 1]),
-                device=torch.device("cuda"),
-            )
-        print(target_cameras["c2w"].shape, target_cameras["fxfycxcy"].shape)
-        states = model.reconstruct(input_data_dict)
-        rendering = model.rendering(target_cameras, states, args.image_size[0], args.image_size[1])
-        video_path = os.path.join(output_dir, f"sample_{sample_idx:06d}_turntable.gif")
-        frames = (rendering[0].permute(0, 2, 3, 1).cpu().numpy() * 255).astype(np.uint8)
-        imageio.mimsave(video_path, frames, fps=30, quality=8)
-        print(f"Saved turntable video to {video_path}")
+            input_data_dict = {key: value[:, :args.num_input_views] for key, value in data_dict.items()}
+            target_data_dict = {key: value[:, -args.num_target_views:] for key, value in data_dict.items()}
+
+        with torch.autocast(dtype=torch.bfloat16, device_type="cuda", enabled=True) and torch.no_grad():
+            rendering = model(input_data_dict, target_data_dict)
+
+            target = target_data_dict["image"]
+            psnr = -10.0 * torch.log10(F.mse_loss(rendering, target)).item()
+
+            print(f"Sample {sample_idx}: PSNR = {psnr:.2f}")
+            
+            # Save rendered images if output directory is specified
+            if output_dir:
+                def tensor_to_numpy(tensor):
+                    """Convert tensor to numpy RGB image."""
+                    numpy_image = tensor.permute(1, 2, 0).cpu().numpy()
+                    numpy_image = np.clip(numpy_image * 255, 0, 255).astype(np.uint8)
+                    return numpy_image
+
+                batch_size, num_views = rendering.shape[:2]
+                for batch_idx in range(batch_size):
+                    # Collect all images for this batch
+                    rendered_images = []
+                    target_images = []
+                    
+                    for view_idx in range(num_views):
+                        rendered_images.append(tensor_to_numpy(rendering[batch_idx, view_idx]))
+                        target_images.append(tensor_to_numpy(target[batch_idx, view_idx]))
+                    
+                    # Concatenate images horizontally (all views side by side)
+                    target_row = np.concatenate(target_images, axis=1)
+                    rendered_row = np.concatenate(rendered_images, axis=1)
+                    
+                    # Stack rendered and target rows vertically
+                    combined_image = np.concatenate([target_row, rendered_row], axis=0)
+                    
+                    # Save the concatenated image
+                    filename = f"sample_{sample_idx:06d}_batch_{batch_idx:02d}.png"
+                    Image.fromarray(combined_image).save(os.path.join(output_dir, filename))
+                
+                print(f"Saved concatenated image for sample {sample_idx} to {output_dir}")
+            
+            # Rendering a video to circularly rotate the camera views
+            if args.scene_inference:
+                target_cameras = get_interpolated_cameras(
+                    cameras=input_data_dict,
+                    num_views=2,
+                )
+            else:
+                target_cameras = get_turntable_cameras_with_zoom_in(
+                    batch_size=1,
+                    num_views=120,
+                    w=args.image_size[0],
+                    h=args.image_size[1],
+                    min_radius=1.7,
+                    max_radius=3.0,
+                    elevation=30,
+                    up_vector=np.array([0, 0, 1]),
+                    device=torch.device("cuda"),
+                )
+            # print(target_cameras["c2w"].shape, target_cameras["fxfycxcy"].shape)
+            states = model.reconstruct(input_data_dict)
+            rendering = model.rendering(target_cameras, states, args.image_size[0], args.image_size[1])
+            video_path = os.path.join(output_dir, f"sample_{sample_idx:06d}_turntable.gif")
+            frames = (rendering[0].permute(0, 2, 3, 1).cpu().numpy() * 255).astype(np.uint8)
+            imageio.mimsave(video_path, frames, fps=30, quality=8)
+            print(f"Saved turntable video to {video_path}")
+
+if __name__ == "__main__":
+    main()

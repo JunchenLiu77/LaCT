@@ -101,6 +101,12 @@ class NVSDataset(Dataset):
         self.sorted_indices = sorted_indices
         self.scene_pose_normalize = scene_pose_normalize
 
+        # filter out the scenes that have less than num_views images
+        original_num_scenes = len(self.data_point_paths)
+        self.data_point_paths = [path for path in self.data_point_paths if len(json.load(open(os.path.join(self.base_dir, path), "r"))) >= num_views]
+        filtered_num_scenes = len(self.data_point_paths)
+        print(f"Found {original_num_scenes} scenes in the index file, filtered out {original_num_scenes - filtered_num_scenes} scenes with less than {num_views} images, remaining {filtered_num_scenes} scenes")
+
         self.num_views = num_views
         if isinstance(image_size, int):
             self.image_size = (image_size, image_size)
@@ -113,6 +119,8 @@ class NVSDataset(Dataset):
     def __getitem__(self, index):
         data_point_path = os.path.join(self.base_dir, self.data_point_paths[index])
         data_point_base_dir = os.path.dirname(data_point_path)
+        scene_name = os.path.basename(data_point_base_dir)
+
         with open(data_point_path, "r") as f:
             images_info = json.load(f)
         
@@ -155,11 +163,12 @@ class NVSDataset(Dataset):
         
         c2ws = torch.stack(c2w_list)
         if self.scene_pose_normalize:
-            print("Normalizing scene poses...")
+            # print("Normalizing scene poses...")
             c2ws = normalize_with_mean_pose(c2ws)
 
         return {
             "fxfycxcy": torch.tensor(fxfycxcy_list),
             "c2w": c2ws,
             "image": torch.stack(image_list),
+            "scene_name": scene_name,
         }
