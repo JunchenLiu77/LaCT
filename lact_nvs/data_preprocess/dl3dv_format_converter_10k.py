@@ -199,7 +199,7 @@ def main():
     # Define paths
     current_dir = Path(__file__).parent
     data_example_dir = current_dir.parent / 'data_example'
-    benchmark_dir = data_example_dir / 'dl3dv_10k/3K'
+    benchmark_dir = data_example_dir / 'dl3dv_10k/4K'
     output_json = data_example_dir / 'dl3dv_10k_sample_data_path.json'
     
     # Optional: Define different input and output directories

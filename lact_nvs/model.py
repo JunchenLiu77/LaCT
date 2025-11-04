@@ -7,7 +7,7 @@ import torch
 import torch.nn as nn
 from torch.nn import LayerNorm
 from torch.nn import functional as F
-
+from transformer import QK_Norm_TransformerBlock, RMSNorm
 from lact_ttt import TTTOperator
 
 def get_class_by_name(name):
@@ -24,7 +24,7 @@ def _init_weights(module):
         torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
         if module.bias is not None:
             torch.nn.init.zeros_(module.bias)
-    elif isinstance(module, (nn.RMSNorm, nn.LayerNorm)):
+    elif isinstance(module, (RMSNorm, nn.LayerNorm)):
         module.reset_parameters()
     elif isinstance(module, nn.Embedding):
         torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
@@ -54,8 +54,8 @@ class SelfAttention(nn.Module):
         self.use_qk_norm = use_qk_norm
 
         if self.use_qk_norm:
-            self.q_norm = nn.RMSNorm(head_dim)
-            self.k_norm = nn.RMSNorm(head_dim)
+            self.q_norm = RMSNorm(head_dim)
+            self.k_norm = RMSNorm(head_dim)
 
         self.causal = causal
 
@@ -93,17 +93,18 @@ class MLP(nn.Module):
 
 
 class Block(nn.Module):
-    def __init__(self, dim, bias, block_config):
+    def __init__(self, dim, bias, block_config, shared_opts=None):
         super().__init__()
         module_list = []
         self.length_dim_list = []
 
         for _, module_config in enumerate(block_config):
-            CLASS = get_class_by_name(module_config["type"])
+            module_name = module_config["type"]
+            CLASS = get_class_by_name(module_name)
             module = nn.ModuleDict(
                 {
                     "ln": LayerNorm(dim, bias=bias),
-                    "f": CLASS(dim=dim, bias=bias, **module_config["params"]),
+                    "f": CLASS(dim=dim, bias=bias, **module_config["params"]) if module_name != "lact_ttt.FastWeightGluMLPMultihead" else CLASS(dim=dim, bias=bias, **module_config["params"], shared_opts=shared_opts),
                 }
             )
 
@@ -172,7 +173,7 @@ def compute_rays(fxfycxcy, c2w, h, w):
 
 
 class LaCTLVSM(nn.Module):
-    def __init__(self, patch_size, dim, layers, block_config):
+    def __init__(self, patch_size, dim, layers, use_shared_opts, block_config):
         super().__init__()
         self.patch_size = patch_size
         self.dim = dim
@@ -183,8 +184,29 @@ class LaCTLVSM(nn.Module):
         self.input_dim = len(self.posed_image_keys) * 3
         self.input_linear = nn.Linear(self.input_dim * (self.patch_size**2), self.dim, bias=False)
         self.input_layernorm = nn.LayerNorm(self.dim, bias=False)
+        opts = None
+        if use_shared_opts and block_config[1]["params"]["use_learnable_opt"]:
+            # if use_shared_opts, we will instantiate one set of opts here and share it across all blocks
+            head_dim = block_config[1]["params"]["head_dim"]
+            opts = nn.ModuleList()
+            for _ in range(3):
+                # map [B, Dh, 2D] to [B, Dh, D]
+                opt = nn.Sequential(
+                    nn.Linear(head_dim * 2, head_dim * 4, bias=False),
+                    nn.GELU(),
+                    nn.Linear(head_dim * 4, head_dim, bias=False),
+                    RMSNorm(head_dim),
+                    *[QK_Norm_TransformerBlock(
+                        dim=head_dim,
+                        head_dim=64,
+                        use_qk_norm=True,
+                        use_positional_encoding=True,
+                    ) for _ in range(block_config[1]["params"]["n_blocks_per_opt"])],
+                )
+                # weight initialization will be applied in the model.py
+                opts.append(opt)
         self.blocks = nn.ModuleList([
-            Block(dim=self.dim, bias=False, block_config=block_config)
+            Block(dim=self.dim, bias=False, block_config=block_config, shared_opts=opts)
             for _ in range(layers)
         ])
 

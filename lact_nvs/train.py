@@ -46,6 +46,7 @@ def main():
     # Inference
     parser.add_argument("--test_every", type=int, default=-1, help="Test every N iterations")
     parser.add_argument("--first_n", type=int, default=None)
+    parser.add_argument("--test_batch_size", type=int, default=1)
     parser.add_argument("--scene_inference", action="store_true")
 
     # Optimizer
@@ -55,8 +56,22 @@ def main():
     parser.add_argument("--weight_decay", type=float, default=0.05)
     parser.add_argument("--lpips_start", type=int, default=5000, help="Iteration to start LPIPS loss")
 
+    # Model
+    parser.add_argument("--use_learnable_opt", action="store_true")
+    parser.add_argument("--n_blocks_per_opt", type=int, default=2)
+    parser.add_argument("--only_train_opts", action="store_true")
+    parser.add_argument("--use_shared_opts", action="store_true")
+
     args = parser.parse_args()
     model_config = omegaconf.OmegaConf.load(args.config)
+    
+    # Overwrite the use_learnable_opt param in model_config if specified in args
+    if hasattr(args, "use_learnable_opt") and args.use_learnable_opt:
+        model_config.block_config[1]["params"]["use_learnable_opt"] = args.use_learnable_opt
+    if hasattr(args, "n_blocks_per_opt") and args.n_blocks_per_opt:
+        model_config.block_config[1]["params"]["n_blocks_per_opt"] = args.n_blocks_per_opt
+    if hasattr(args, "use_shared_opts") and args.use_shared_opts:
+        model_config.use_shared_opts = args.use_shared_opts
     output_dir = f"output/{args.expname}"
     os.makedirs(output_dir, exist_ok=True)
 
@@ -76,9 +91,27 @@ def main():
 
     model = LaCTLVSM(**model_config).cuda()
 
-    # Optimizers
-    decay_params = [p for p in model.parameters() if p.dim() >= 2]
-    nodecay_params = [p for p in model.parameters() if p.dim() < 2]
+    # Config learnable params
+    learnable_params = []
+    learnable_param_names = []
+    frozen_param_names = []
+    learnable_params_count = 0
+    frozen_params_count = 0
+    
+    for n, p in model.named_parameters():
+        if not args.only_train_opts or ("opts" in n):
+            learnable_params.append(p)
+            learnable_param_names.append(n)
+            learnable_params_count += p.numel()
+            p.requires_grad = True
+        else:
+            p.requires_grad = False
+            frozen_param_names.append(n)
+            frozen_params_count += p.numel()
+    
+    # Config optimizer
+    decay_params = [p for p in learnable_params if p.dim() >= 2]
+    nodecay_params = [p for p in learnable_params if p.dim() < 2]
     optim_groups = [
         {"params": decay_params, "weight_decay": args.weight_decay},
         {"params": nodecay_params, "weight_decay": 0.0},
@@ -170,21 +203,31 @@ def main():
 
     if args.test_every > 0:
         test_set = NVSDataset(args.data_path, args.num_all_views, tuple(args.image_size), sorted_indices=True, scene_pose_normalize=args.scene_pose_normalize)
+        test_sampler = DistributedSampler(test_set)
         test_dataloader_seed_generator = torch.Generator()
         test_dataloader_seed_generator.manual_seed(rank_specific_seed)
         test_loader = DataLoader(
             test_set,
             batch_size=args.bs_per_gpu,
             shuffle=False,
+            num_workers=4,
+            persistent_workers=True,
+            pin_memory=True,
+            prefetch_factor=2, 
+            sampler=test_sampler,
             generator=test_dataloader_seed_generator,    # This ensures deterministic dataloader
         )
+        test_sampler.set_epoch(0)
 
     if dist.get_rank() == 0:
         # report training config only on the master
         print(f"Training config:")
-        print(model)
-        print(optimizer)
-        print(lr_scheduler)
+        # print(model)
+        # print(optimizer)
+        # print(lr_scheduler)
+        print(f"Learnable params: {learnable_param_names}, {learnable_params_count / 1e6:.2f} MB in total")
+        print(f"Frozen params: {frozen_param_names}, {frozen_params_count / 1e6:.2f} MB in total")
+
         if args.actckpt:
             print(f"Activation checkpointing applied")
         print(f"Starting training from iter {now_iters}...")
@@ -279,7 +322,7 @@ def main():
                         "epoch": epoch,
                     }, f"{output_dir}/model_{now_iters:07d}.pth")
 
-            if args.test_every > 0 and now_iters % args.test_every == 0:
+            if args.test_every > 0 and (now_iters % args.test_every == 0 or now_iters == 1):
                 # instantiate a new data iter each time
                 test_iter = iter(test_loader)
                 output_dir = f"output/{args.expname}/{now_iters:07d}_test"
@@ -352,7 +395,7 @@ def main():
 
                             # Log the metrics as csv file
                             with open(os.path.join(scene_dir, "metrics.csv"), "a") as f:
-                                f.write(f"{sample_idx:06d},{batch_idx:02d},{scene_name},{psnr:.2f},{lpips_loss:.4f}\n")
+                                f.write(f"{scene_name},{psnr:.2f},{lpips_loss:.4f}\n")
                         
                         # Rendering a video to circularly rotate the camera views
                         # if args.scene_inference:
@@ -388,15 +431,28 @@ def main():
                     scenes = os.listdir(output_dir)
                     psnr_list = []
                     lpips_list = []
+                    scene_names = []
                     for scene in scenes:
                         scene_dir = os.path.join(output_dir, scene)
                         metrics_path = os.path.join(scene_dir, "metrics.csv")
                         if os.path.exists(metrics_path):
                             metrics = np.loadtxt(metrics_path, delimiter=",", dtype=str)
-                            psnr_list.append(np.array(metrics[3], dtype=np.float32).mean())
-                            lpips_list.append(np.array(metrics[4], dtype=np.float32).mean())
+                            scene_names.append(metrics[0])
+                            psnr_list.append(np.array(metrics[1], dtype=np.float32).mean())
+                            lpips_list.append(np.array(metrics[2], dtype=np.float32).mean())
                     avg_psnr = np.array(psnr_list, dtype=np.float32).mean()
                     avg_lpips = np.array(lpips_list, dtype=np.float32).mean()
+                    
+                    # log in csv file
+                    with open(os.path.join(output_dir, "metrics.csv"), "a") as f:
+                        # scene_name,psnr,lpips
+                        f.write("scene_name,psnr,lpips\n")
+                        for scene_name, psnr_val, lpips_val in zip(scene_names, psnr_list, lpips_list):
+                            f.write(f"{scene_name},{psnr_val:.2f},{lpips_val:.4f}\n")
+                        # average psnr and lpips
+                        f.write(f"average,{avg_psnr:.2f},{avg_lpips:.4f}\n")
+                    
+                    # log in wandb
                     print(f"[{now_iters:07d}] Average PSNR = {avg_psnr:.2f}, Average LPIPS = {avg_lpips:.4f}")
                     wandb.log({
                         "test/psnr": avg_psnr,

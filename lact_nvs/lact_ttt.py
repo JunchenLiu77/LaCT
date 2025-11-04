@@ -6,6 +6,7 @@ from torch import nn
 
 import torch.nn.functional as F
 from einops import rearrange
+from transformer import QK_Norm_TransformerBlock, RMSNorm
 
 TTTOperator = collections.namedtuple("TTTOperator", ["start", "end", "update", "apply"])
 
@@ -67,7 +68,8 @@ def zeropower_via_newtonschulz5(G, steps):
     return X
 
 
-@torch.compile
+# disable compile for the learnable opt.
+# @torch.compile
 def fast_weight_swish_glu_weight_norm_mini_batch_apply(
     w0: torch.Tensor,
     w1: torch.Tensor,
@@ -80,6 +82,8 @@ def fast_weight_swish_glu_weight_norm_mini_batch_apply(
     lr2: torch.Tensor,
     ttt_ua_order: list,
     muon_update_steps: int = 0,
+    use_learnable_opt: bool = False,
+    opts: nn.ModuleList = None,
 ):
     """
     Note:
@@ -92,6 +96,8 @@ def fast_weight_swish_glu_weight_norm_mini_batch_apply(
     k: [b, l, d]
     v: [b, l, d]
     lr0, lr1, lr2: [b, l, 1]
+    use_learnable_opt: if True, the opts will be used to update the weights.
+    opts: if use_learnable_opt is True, this should contains three learnable optimizers to update w0, w1, w2.
     """
     w0_norm = w0.detach().norm(dim=1, keepdim=True)
     w1_norm = w1.detach().norm(dim=1, keepdim=True)
@@ -116,18 +122,27 @@ def fast_weight_swish_glu_weight_norm_mini_batch_apply(
             dgate = dhidden * hidden_before_mul
             dgate_before_act = silu_backprop(dgate, gate_before_act)
 
-            w1_grad = zeropower_via_newtonschulz5(
-                (hidden * lr1i).transpose(-1, -2) @ vi, muon_update_steps
-            )
-            w0_grad = zeropower_via_newtonschulz5(
-                (ki * lr0i).transpose(-1, -2) @ dgate_before_act, muon_update_steps
-            )
-            w2_grad = zeropower_via_newtonschulz5(
-                (ki * lr2i).transpose(-1, -2) @ dhidden_before_mul, muon_update_steps
-            )
-            w1_now = w1_now + w1_grad
-            w0_now = w0_now + w0_grad
-            w2_now = w2_now + w2_grad
+            w1_grad = ((hidden * lr1i).transpose(-1, -2) @ vi)
+            w0_grad = ((ki * lr0i).transpose(-1, -2) @ dgate_before_act)
+            w2_grad = ((ki * lr2i).transpose(-1, -2) @ dhidden_before_mul)
+
+            if not use_learnable_opt:
+                w1_update = zeropower_via_newtonschulz5(w1_grad, muon_update_steps)
+                w0_update = zeropower_via_newtonschulz5(w0_grad, muon_update_steps)
+                w2_update = zeropower_via_newtonschulz5(w2_grad, muon_update_steps)
+            else:
+                # w0 and w2 need to reshape to [B, Dh, 2D]
+                opt1_input = torch.cat([w1_now, w1_grad.detach()], dim=2)
+                opt0_input = rearrange(torch.cat([w0_now, w0_grad.detach()], dim=1), "b d dh -> b dh d")
+                opt2_input = rearrange(torch.cat([w2_now, w2_grad.detach()], dim=1), "b d dh -> b dh d")
+
+                w1_update = opts[1](opt1_input)
+                w0_update = rearrange(opts[0](opt0_input), "b dh d -> b d dh")
+                w2_update = rearrange(opts[2](opt2_input), "b dh d -> b d dh")
+            
+            w1_now = w1_now + w1_update
+            w0_now = w0_now + w0_update
+            w2_now = w2_now + w2_update
 
             # do weight norm here
             w0_now = w0_now / (w0_now.norm(dim=1, keepdim=True) + 1e-5) * w0_norm
@@ -171,6 +186,9 @@ class FastWeightGluMLPMultihead(nn.Module):
         bias: bool = False,
         base_lr=0.01,
         muon_update_steps=0,
+        use_learnable_opt: bool = False,
+        n_blocks_per_opt: int = 2,
+        shared_opts: nn.ModuleList = None,
     ):
         super().__init__()
         self.dim = dim
@@ -184,13 +202,13 @@ class FastWeightGluMLPMultihead(nn.Module):
         gain = math.sqrt(2)  # for relu activations
         self.w0 = nn.Parameter(
             torch.randn(self.num_heads, d_in, d_h) * gain / math.sqrt(d_in)
-        )  # [d_h * num_heads,  d_in]
+        )  # [num_heads, d_in, d_h]
         self.w1 = nn.Parameter(
             torch.randn(self.num_heads, d_h, d_out) * gain / math.sqrt(d_h)
-        )  # [d_in * num_heads,  d_h]
+        )  # [num_heads, d_h, d_out]
         self.w2 = nn.Parameter(
             torch.randn(self.num_heads, d_in, d_h) * gain / math.sqrt(d_in)
-        )  # [d_h * num_heads,  d_in]
+        )  # [num_heads, d_in, d_h]
 
         self.to_qkv = nn.Linear(dim, 3 * dim, bias=bias)
         self.c_proj = nn.Linear(dim, dim, bias=bias)
@@ -199,8 +217,35 @@ class FastWeightGluMLPMultihead(nn.Module):
         self.lr_fc = nn.Linear(dim, self.lr_dim * 3)
         self.base_lr_inv = inv_softplus(base_lr)
 
-        self.o_norm = torch.nn.RMSNorm(head_dim, eps=1e-5, elementwise_affine=True)
+        self.o_norm = RMSNorm(head_dim)
 
+        # learnable opt.
+        self.use_learnable_opt = use_learnable_opt
+        self.n_blocks_per_opt = n_blocks_per_opt
+        if use_learnable_opt:
+            if shared_opts is not None:
+                assert len(shared_opts) == 3, f"shared_opts should contain 3 learnable optimizers, but got {len(shared_opts)}"
+                self.opts = shared_opts
+            else:
+                # use transformer blocks as learnable optimizers, model the d_h as the sequence dimension always.
+                self.opts = nn.ModuleList()
+                for _ in range(3):
+                    # map [B, Dh, 2D] to [B, Dh, D]
+                    opt = nn.Sequential(
+                        nn.Linear(head_dim * 2, head_dim * 4, bias=False),
+                        nn.GELU(),
+                        nn.Linear(head_dim * 4, head_dim, bias=False),
+                        RMSNorm(head_dim),
+                        *[QK_Norm_TransformerBlock(
+                            dim=head_dim,
+                            head_dim=64,
+                            use_qk_norm=True,
+                            use_positional_encoding=True,
+                        ) for _ in range(n_blocks_per_opt)],
+                    )
+                    # weight initialization will be applied in the model.py
+                    self.opts.append(opt)
+        
     def forward(self, x: torch.Tensor, info={}, *args):
         """
         x: (b, l, d)
@@ -214,9 +259,9 @@ class FastWeightGluMLPMultihead(nn.Module):
         k = k / (k.norm(dim=2, keepdim=True) + 1e-5).to(x.dtype)
 
         with torch.autocast(device_type="cuda", enabled=False):
-            lr = self.lr_fc(x.float())  # [b, l, lr_dim]
+            lr = self.lr_fc(x)  # [b, l, lr_dim]
 
-        lr = torch.nn.functional.softplus(lr.float() + self.base_lr_inv)
+        lr = torch.nn.functional.softplus(lr + self.base_lr_inv)
         lr0, lr1, lr2 = rearrange(
             lr, "b l (lrs h d) -> lrs (b h) l d",
             lrs=3, h=self.num_heads
@@ -235,6 +280,8 @@ class FastWeightGluMLPMultihead(nn.Module):
         output, w0, w1, w2 = fast_weight_swish_glu_weight_norm_mini_batch_apply(
             w0, w1, w2, q, k, v, lr0, lr1, lr2, info["ttt_op_order"],
             muon_update_steps=self.muon_update_steps,
+            use_learnable_opt=self.use_learnable_opt,
+            opts=self.opts if self.use_learnable_opt else None,
         )
 
         output = self.o_norm(output)

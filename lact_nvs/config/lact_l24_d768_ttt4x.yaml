@@ -1,6 +1,7 @@
 patch_size: 8
 dim: 768
 layers: 24
+use_shared_opts: false
 
 block_config:
   - type: model.SelfAttention
@@ -15,6 +16,8 @@ block_config:
       inter_multi: 4
       base_lr: 0.01
       muon_update_steps: 5
+      use_learnable_opt: false
+      n_blocks_per_opt: 1
   - type: model.MLP
     length_dim: vl
     params:

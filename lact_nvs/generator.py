@@ -127,6 +127,14 @@ class Generator:
                 base += " --scene_inference"
             if args.first_n is not None:
                 base += f" --first_n {args.first_n}"
+            if args.use_learnable_opt:
+                base += " --use_learnable_opt"
+            if args.n_blocks_per_opt is not None:
+                base += f" --n_blocks_per_opt {args.n_blocks_per_opt}"
+            if args.only_train_opts:
+                base += " --only_train_opts"
+            if args.use_shared_opts:
+                base += " --use_shared_opts"
             run_cmd = f"srun --time {args.time or self.slurm_defaults['time']} uv run {base}"
 
         # Generate the script content
@@ -243,6 +251,8 @@ def main():
                         help='Use scene inference mode')
     parser.add_argument('--first-n', type=int,
                         help='First N samples to process')
+    parser.add_argument('--test-batch-size', type=int,
+                        help='Test batch size')
     
     # Training-only arguments
     parser.add_argument('--save-every', type=int,
@@ -269,7 +279,15 @@ def main():
                         help='Iteration to start LPIPS loss')
     parser.add_argument('--test-every', type=int,
                         help='Test every N iterations')
-    
+    parser.add_argument('--use-learnable-opt', action='store_true',
+                        help='Use learnable optimizer')
+    parser.add_argument('--n-blocks-per-opt', type=int,
+                        help='Number of blocks per optimizer')
+    parser.add_argument('--only-train-opts', action='store_true',
+                        help='Only train the optimizer')
+    parser.add_argument('--use-shared-opts', action='store_true',
+                        help='Use shared optimizer')
+
     # SLURM configuration
     parser.add_argument('--time', type=str,
                         help='Wall time limit (e.g., 01-00:00:00)')
