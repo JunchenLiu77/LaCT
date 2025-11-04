@@ -7,7 +7,6 @@ import torch
 import torch.nn as nn
 from torch.nn import LayerNorm
 from torch.nn import functional as F
-from transformer import QK_Norm_TransformerBlock, RMSNorm
 from lact_ttt import TTTOperator
 
 def get_class_by_name(name):
@@ -24,7 +23,7 @@ def _init_weights(module):
         torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
         if module.bias is not None:
             torch.nn.init.zeros_(module.bias)
-    elif isinstance(module, (RMSNorm, nn.LayerNorm)):
+    elif isinstance(module, (nn.RMSNorm, nn.LayerNorm)):
         module.reset_parameters()
     elif isinstance(module, nn.Embedding):
         torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
@@ -54,8 +53,8 @@ class SelfAttention(nn.Module):
         self.use_qk_norm = use_qk_norm
 
         if self.use_qk_norm:
-            self.q_norm = RMSNorm(head_dim)
-            self.k_norm = RMSNorm(head_dim)
+            self.q_norm = nn.RMSNorm(head_dim)
+            self.k_norm = nn.RMSNorm(head_dim)
 
         self.causal = causal
 
@@ -189,22 +188,19 @@ class LaCTLVSM(nn.Module):
             # if use_shared_opts, we will instantiate one set of opts here and share it across all blocks
             head_dim = block_config[1]["params"]["head_dim"]
             opts = nn.ModuleList()
+            from dit import DiT
+
             for _ in range(3):
-                # map [B, Dh, 2D] to [B, Dh, D]
-                opt = nn.Sequential(
-                    nn.Linear(head_dim * 2, head_dim * 4, bias=False),
-                    nn.GELU(),
-                    nn.Linear(head_dim * 4, head_dim, bias=False),
-                    RMSNorm(head_dim),
-                    *[QK_Norm_TransformerBlock(
-                        dim=head_dim,
-                        head_dim=64,
-                        use_qk_norm=True,
-                        use_positional_encoding=True,
-                    ) for _ in range(block_config[1]["params"]["n_blocks_per_opt"])],
+                # use DiT to update the fast weight iteratively, map [B, Dh, 2D] to [B, Dh, 2D]
+                opt = DiT(
+                    hidden_size=head_dim * 2,
+                    depth=block_config[1]["params"]["n_blocks_per_opt"],
+                    num_heads=head_dim * 2 // 64,
+                    mlp_ratio=4.0
                 )
                 # weight initialization will be applied in the model.py
                 opts.append(opt)
+            
         self.blocks = nn.ModuleList([
             Block(dim=self.dim, bias=False, block_config=block_config, shared_opts=opts)
             for _ in range(layers)
@@ -218,6 +214,9 @@ class LaCTLVSM(nn.Module):
 
         # apply special scaled init to the residual projections, per GPT-2 paper
         self.apply(_init_weights)
+        # re-initialize the weights of DiT opts
+        for opt in opts:
+            opt.initialize_weights()
         for pn, p in self.named_parameters():
             if pn.endswith("c_proj.weight"):
                 torch.nn.init.normal_(p, mean=0.0, std=0.02 / math.sqrt(len(block_config) * layers))

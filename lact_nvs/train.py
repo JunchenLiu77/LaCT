@@ -261,6 +261,142 @@ def main():
     lpips_loss_module = lpips.LPIPS(net="vgg").cuda().eval()
     for epoch in range((remaining_steps - 1) // len(train_loader) + 1):
         for data_dict in train_loader:
+            if args.test_every > 0 and (now_iters % args.test_every == 0 or now_iters == 0):
+                # instantiate a new data iter each time
+                test_iter = iter(test_loader)
+                test_dir = f"output/{args.expname}/{now_iters:07d}_test"
+                os.makedirs(test_dir, exist_ok=True)
+                print(f"[{dist.get_rank():02d}, {ddp_local_rank:02d}] Testing from iter {now_iters:07d}...")
+                for sample_idx, data_dict in enumerate(test_iter):
+                    print(f"[{dist.get_rank():02d}, {ddp_local_rank:02d}] Testing sample {sample_idx:07d}...")
+                    if args.first_n is not None and sample_idx >= args.first_n:
+                        break
+                    scene_names = data_dict["scene_name"]
+                    data_dict = {key: value.cuda() for key, value in data_dict.items() if isinstance(value, torch.Tensor)}
+                    if args.scene_inference:
+                        # Randomly select input views and use remaining as target
+                        total_views = data_dict["image"].shape[1]
+                        all_indices = torch.randperm(total_views)
+                        input_indices = torch.sort(all_indices[:args.num_input_views])[0]   # Sort for video rendering only; model forward is permutation-invariant
+                        target_indices = all_indices[-args.num_target_views:]
+                        
+                        input_data_dict = {key: value[:, input_indices] for key, value in data_dict.items()}
+                        target_data_dict = {key: value[:, target_indices] for key, value in data_dict.items()}
+                    else:
+                        input_data_dict = {key: value[:, :args.num_input_views] for key, value in data_dict.items()}
+                        target_data_dict = {key: value[:, -args.num_target_views:] for key, value in data_dict.items()}
+
+                    with torch.autocast(dtype=torch.bfloat16, device_type="cuda", enabled=True) and torch.no_grad():
+                        rendering = model(input_data_dict, target_data_dict)
+
+                        # target = target_data_dict["image"]
+                        # psnr = -10.0 * torch.log10(F.mse_loss(rendering, target)).item()
+                        # lpips_loss = lpips_loss_module(rendering.flatten(0, 1), target.flatten(0, 1), normalize=True).mean().item()
+                        # test_psnr_list.append(psnr)
+                        # test_lpips_list.append(lpips_loss)
+                        # print(f"Sample {sample_idx}: PSNR = {psnr:.2f}, LPIPS = {lpips_loss:.4f}")
+                        
+                        # Save rendered images
+                        def tensor_to_numpy(tensor):
+                            """Convert tensor to numpy RGB image."""
+                            numpy_image = tensor.permute(1, 2, 0).cpu().numpy()
+                            numpy_image = np.clip(numpy_image * 255, 0, 255).astype(np.uint8)
+                            return numpy_image
+
+                        batch_size, num_views = rendering.shape[:2]
+                        for batch_idx in range(batch_size):
+                            scene_name = scene_names[batch_idx]
+                            scene_dir = os.path.join(test_dir, scene_name)
+                            os.makedirs(scene_dir, exist_ok=True)
+
+                            # Compute metrics
+                            target = target_data_dict["image"][batch_idx]
+                            rendered = rendering[batch_idx]
+                            psnr = -10.0 * torch.log10(F.mse_loss(rendered, target)).item()
+                            lpips_loss = lpips_loss_module(rendered, target, normalize=True).mean().item()
+
+                            # Collect all images for this batch
+                            rendered_images = []
+                            target_images = []
+                            for view_idx in range(num_views):
+                                rendered_images.append(tensor_to_numpy(rendered[view_idx]))
+                                target_images.append(tensor_to_numpy(target[view_idx]))
+                            
+                            # Concatenate images horizontally (all views side by side)
+                            target_row = np.concatenate(target_images, axis=1)
+                            rendered_row = np.concatenate(rendered_images, axis=1)
+                            
+                            # Stack rendered and target rows vertically
+                            combined_image = np.concatenate([target_row, rendered_row], axis=0)
+                            
+                            # Save the concatenated image
+                            Image.fromarray(combined_image).save(os.path.join(scene_dir, f"sample_{sample_idx:06d}_batch_{batch_idx:02d}.png"))
+
+                            # Log the metrics as csv file
+                            with open(os.path.join(scene_dir, "metrics.csv"), "a") as f:
+                                f.write(f"{scene_name},{psnr:.2f},{lpips_loss:.4f}\n")
+                        
+                        # Rendering a video to circularly rotate the camera views
+                        # if args.scene_inference:
+                        #     target_cameras = get_interpolated_cameras(
+                        #         cameras=input_data_dict,
+                        #         num_views=2,
+                        #     )
+                        # else:
+                        #     target_cameras = get_turntable_cameras_with_zoom_in(
+                        #         batch_size=1,
+                        #         num_views=120,
+                        #         w=args.image_size[0],
+                        #         h=args.image_size[1],
+                        #         min_radius=1.7,
+                        #         max_radius=3.0,
+                        #         elevation=30,
+                        #         up_vector=np.array([0, 0, 1]),
+                        #         device=torch.device("cuda"),
+                        #     )
+                        # # print(target_cameras["c2w"].shape, target_cameras["fxfycxcy"].shape)
+                        # states = model.module.reconstruct(input_data_dict)
+                        # rendering = model.module.rendering(target_cameras, states, args.image_size[0], args.image_size[1])
+                        # video_path = os.path.join(test_dir, f"sample_{sample_idx:06d}_turntable.gif")
+                        # frames = (rendering[0].permute(0, 2, 3, 1).cpu().numpy() * 255).astype(np.uint8)
+                        # imageio.mimsave(video_path, frames, fps=30, quality=8)
+                        # print(f"Saved turntable video to {video_path}")
+                
+                torch.cuda.empty_cache()
+                dist.barrier()
+
+                # Compute average metrics at rank 0
+                if dist.get_rank() == 0:
+                    scenes = os.listdir(test_dir)
+                    psnr_list = []
+                    lpips_list = []
+                    scene_names = []
+                    for scene in scenes:
+                        scene_dir = os.path.join(test_dir, scene)
+                        metrics_path = os.path.join(scene_dir, "metrics.csv")
+                        if os.path.exists(metrics_path):
+                            metrics = np.loadtxt(metrics_path, delimiter=",", dtype=str)
+                            scene_names.append(metrics[0])
+                            psnr_list.append(np.array(metrics[1], dtype=np.float32).mean())
+                            lpips_list.append(np.array(metrics[2], dtype=np.float32).mean())
+                    avg_psnr = np.array(psnr_list, dtype=np.float32).mean()
+                    avg_lpips = np.array(lpips_list, dtype=np.float32).mean()
+                    
+                    # log in csv file
+                    with open(os.path.join(test_dir, "metrics.csv"), "a") as f:
+                        # scene_name,psnr,lpips
+                        f.write("scene_name,psnr,lpips\n")
+                        for scene_name, psnr_val, lpips_val in zip(scene_names, psnr_list, lpips_list):
+                            f.write(f"{scene_name},{psnr_val:.2f},{lpips_val:.4f}\n")
+                        # average psnr and lpips
+                        f.write(f"average,{avg_psnr:.2f},{avg_lpips:.4f}\n")
+                    
+                    # log in wandb
+                    print(f"[{now_iters:07d}] Average PSNR = {avg_psnr:.2f}, Average LPIPS = {avg_lpips:.4f}")
+                    wandb.log({
+                        "test/psnr": avg_psnr,
+                        "test/lpips": avg_lpips,
+                    }, step=now_iters)
             data_dict = {key: value.cuda() for key, value in data_dict.items() if isinstance(value, torch.Tensor)}
             input_data_dict = {key: value[:, :args.num_input_views] for key, value in data_dict.items()}
             target_data_dict = {key: value[:, -args.num_target_views:] for key, value in data_dict.items()}
@@ -312,7 +448,7 @@ def main():
                         log_dict["train/grad_norm"] = global_grad_norm
                         log_dict["train/skip_optimizer_step"] = int(skip_optimizer_step)
                     wandb.log(log_dict, step=now_iters)
-                        
+                
                 if now_iters % args.save_every == 0:
                     torch.save({
                         "model": remove_module_prefix(model.state_dict()),
@@ -321,143 +457,7 @@ def main():
                         "now_iters": now_iters,
                         "epoch": epoch,
                     }, f"{output_dir}/model_{now_iters:07d}.pth")
-
-            if args.test_every > 0 and (now_iters % args.test_every == 0 or now_iters == 1):
-                # instantiate a new data iter each time
-                test_iter = iter(test_loader)
-                output_dir = f"output/{args.expname}/{now_iters:07d}_test"
-                os.makedirs(output_dir, exist_ok=True)
-                print(f"[{dist.get_rank():02d}, {ddp_local_rank:02d}] Testing from iter {now_iters:07d}...")
-                for sample_idx, data_dict in enumerate(test_iter):
-                    print(f"[{dist.get_rank():02d}, {ddp_local_rank:02d}] Testing sample {sample_idx:07d}...")
-                    if args.first_n is not None and sample_idx >= args.first_n:
-                        break
-                    scene_names = data_dict["scene_name"]
-                    data_dict = {key: value.cuda() for key, value in data_dict.items() if isinstance(value, torch.Tensor)}
-                    if args.scene_inference:
-                        # Randomly select input views and use remaining as target
-                        total_views = data_dict["image"].shape[1]
-                        all_indices = torch.randperm(total_views)
-                        input_indices = torch.sort(all_indices[:args.num_input_views])[0]   # Sort for video rendering only; model forward is permutation-invariant
-                        target_indices = all_indices[-args.num_target_views:]
-                        
-                        input_data_dict = {key: value[:, input_indices] for key, value in data_dict.items()}
-                        target_data_dict = {key: value[:, target_indices] for key, value in data_dict.items()}
-                    else:
-                        input_data_dict = {key: value[:, :args.num_input_views] for key, value in data_dict.items()}
-                        target_data_dict = {key: value[:, -args.num_target_views:] for key, value in data_dict.items()}
-
-                    with torch.autocast(dtype=torch.bfloat16, device_type="cuda", enabled=True) and torch.no_grad():
-                        rendering = model(input_data_dict, target_data_dict)
-
-                        # target = target_data_dict["image"]
-                        # psnr = -10.0 * torch.log10(F.mse_loss(rendering, target)).item()
-                        # lpips_loss = lpips_loss_module(rendering.flatten(0, 1), target.flatten(0, 1), normalize=True).mean().item()
-                        # test_psnr_list.append(psnr)
-                        # test_lpips_list.append(lpips_loss)
-                        # print(f"Sample {sample_idx}: PSNR = {psnr:.2f}, LPIPS = {lpips_loss:.4f}")
-                        
-                        # Save rendered images
-                        def tensor_to_numpy(tensor):
-                            """Convert tensor to numpy RGB image."""
-                            numpy_image = tensor.permute(1, 2, 0).cpu().numpy()
-                            numpy_image = np.clip(numpy_image * 255, 0, 255).astype(np.uint8)
-                            return numpy_image
-
-                        batch_size, num_views = rendering.shape[:2]
-                        for batch_idx in range(batch_size):
-                            scene_name = scene_names[batch_idx]
-                            scene_dir = os.path.join(output_dir, scene_name)
-                            os.makedirs(scene_dir, exist_ok=True)
-
-                            # Compute metrics
-                            target = target_data_dict["image"][batch_idx]
-                            rendered = rendering[batch_idx]
-                            psnr = -10.0 * torch.log10(F.mse_loss(rendered, target)).item()
-                            lpips_loss = lpips_loss_module(rendered, target, normalize=True).mean().item()
-
-                            # Collect all images for this batch
-                            rendered_images = []
-                            target_images = []
-                            for view_idx in range(num_views):
-                                rendered_images.append(tensor_to_numpy(rendered[view_idx]))
-                                target_images.append(tensor_to_numpy(target[view_idx]))
-                            
-                            # Concatenate images horizontally (all views side by side)
-                            target_row = np.concatenate(target_images, axis=1)
-                            rendered_row = np.concatenate(rendered_images, axis=1)
-                            
-                            # Stack rendered and target rows vertically
-                            combined_image = np.concatenate([target_row, rendered_row], axis=0)
-                            
-                            # Save the concatenated image
-                            Image.fromarray(combined_image).save(os.path.join(scene_dir, f"sample_{sample_idx:06d}_batch_{batch_idx:02d}.png"))
-
-                            # Log the metrics as csv file
-                            with open(os.path.join(scene_dir, "metrics.csv"), "a") as f:
-                                f.write(f"{scene_name},{psnr:.2f},{lpips_loss:.4f}\n")
-                        
-                        # Rendering a video to circularly rotate the camera views
-                        # if args.scene_inference:
-                        #     target_cameras = get_interpolated_cameras(
-                        #         cameras=input_data_dict,
-                        #         num_views=2,
-                        #     )
-                        # else:
-                        #     target_cameras = get_turntable_cameras_with_zoom_in(
-                        #         batch_size=1,
-                        #         num_views=120,
-                        #         w=args.image_size[0],
-                        #         h=args.image_size[1],
-                        #         min_radius=1.7,
-                        #         max_radius=3.0,
-                        #         elevation=30,
-                        #         up_vector=np.array([0, 0, 1]),
-                        #         device=torch.device("cuda"),
-                        #     )
-                        # # print(target_cameras["c2w"].shape, target_cameras["fxfycxcy"].shape)
-                        # states = model.module.reconstruct(input_data_dict)
-                        # rendering = model.module.rendering(target_cameras, states, args.image_size[0], args.image_size[1])
-                        # video_path = os.path.join(output_dir, f"sample_{sample_idx:06d}_turntable.gif")
-                        # frames = (rendering[0].permute(0, 2, 3, 1).cpu().numpy() * 255).astype(np.uint8)
-                        # imageio.mimsave(video_path, frames, fps=30, quality=8)
-                        # print(f"Saved turntable video to {video_path}")
-                
-                torch.cuda.empty_cache()
-                dist.barrier()
-
-                # Compute average metrics at rank 0
-                if dist.get_rank() == 0:
-                    scenes = os.listdir(output_dir)
-                    psnr_list = []
-                    lpips_list = []
-                    scene_names = []
-                    for scene in scenes:
-                        scene_dir = os.path.join(output_dir, scene)
-                        metrics_path = os.path.join(scene_dir, "metrics.csv")
-                        if os.path.exists(metrics_path):
-                            metrics = np.loadtxt(metrics_path, delimiter=",", dtype=str)
-                            scene_names.append(metrics[0])
-                            psnr_list.append(np.array(metrics[1], dtype=np.float32).mean())
-                            lpips_list.append(np.array(metrics[2], dtype=np.float32).mean())
-                    avg_psnr = np.array(psnr_list, dtype=np.float32).mean()
-                    avg_lpips = np.array(lpips_list, dtype=np.float32).mean()
-                    
-                    # log in csv file
-                    with open(os.path.join(output_dir, "metrics.csv"), "a") as f:
-                        # scene_name,psnr,lpips
-                        f.write("scene_name,psnr,lpips\n")
-                        for scene_name, psnr_val, lpips_val in zip(scene_names, psnr_list, lpips_list):
-                            f.write(f"{scene_name},{psnr_val:.2f},{lpips_val:.4f}\n")
-                        # average psnr and lpips
-                        f.write(f"average,{avg_psnr:.2f},{avg_lpips:.4f}\n")
-                    
-                    # log in wandb
-                    print(f"[{now_iters:07d}] Average PSNR = {avg_psnr:.2f}, Average LPIPS = {avg_lpips:.4f}")
-                    wandb.log({
-                        "test/psnr": avg_psnr,
-                        "test/lpips": avg_lpips,
-                    }, step=now_iters)
+                    print(f"[{now_iters:07d}] Checkpoint saved to {output_dir}/model_{now_iters:07d}.pth")
             
             if now_iters == args.steps:
                 break

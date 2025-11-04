@@ -6,7 +6,6 @@ from torch import nn
 
 import torch.nn.functional as F
 from einops import rearrange
-from transformer import QK_Norm_TransformerBlock, RMSNorm
 
 TTTOperator = collections.namedtuple("TTTOperator", ["start", "end", "update", "apply"])
 
@@ -68,7 +67,6 @@ def zeropower_via_newtonschulz5(G, steps):
     return X
 
 
-# disable compile for the learnable opt.
 # @torch.compile
 def fast_weight_swish_glu_weight_norm_mini_batch_apply(
     w0: torch.Tensor,
@@ -103,6 +101,8 @@ def fast_weight_swish_glu_weight_norm_mini_batch_apply(
     w1_norm = w1.detach().norm(dim=1, keepdim=True)
     w2_norm = w2.detach().norm(dim=1, keepdim=True)
 
+    d = w0.shape[1]
+
     output = []
     for start, end, update, apply in ttt_ua_order:
         w0_now, w1_now, w2_now = w0, w1, w2
@@ -126,19 +126,25 @@ def fast_weight_swish_glu_weight_norm_mini_batch_apply(
             w0_grad = ((ki * lr0i).transpose(-1, -2) @ dgate_before_act)
             w2_grad = ((ki * lr2i).transpose(-1, -2) @ dhidden_before_mul)
 
-            if not use_learnable_opt:
-                w1_update = zeropower_via_newtonschulz5(w1_grad, muon_update_steps)
-                w0_update = zeropower_via_newtonschulz5(w0_grad, muon_update_steps)
-                w2_update = zeropower_via_newtonschulz5(w2_grad, muon_update_steps)
-            else:
-                # w0 and w2 need to reshape to [B, Dh, 2D]
-                opt1_input = torch.cat([w1_now, w1_grad.detach()], dim=2)
-                opt0_input = rearrange(torch.cat([w0_now, w0_grad.detach()], dim=1), "b d dh -> b dh d")
-                opt2_input = rearrange(torch.cat([w2_now, w2_grad.detach()], dim=1), "b d dh -> b dh d")
+            # orthogonalized gradients
+            w1_grad = zeropower_via_newtonschulz5(w1_grad, muon_update_steps)
+            w0_grad = zeropower_via_newtonschulz5(w0_grad, muon_update_steps)
+            w2_grad = zeropower_via_newtonschulz5(w2_grad, muon_update_steps)
 
-                w1_update = opts[1](opt1_input)
-                w0_update = rearrange(opts[0](opt0_input), "b dh d -> b d dh")
-                w2_update = rearrange(opts[2](opt2_input), "b dh d -> b d dh")
+            if not use_learnable_opt:
+                w1_update = w1_grad
+                w0_update = w0_grad
+                w2_update = w2_grad
+            else:
+                opt1_input = torch.cat([w1_now, w1_grad], dim=2)
+                opt0_input = rearrange(torch.cat([w0_now, w0_grad], dim=1), "b d dh -> b dh d")
+                opt2_input = rearrange(torch.cat([w2_now, w2_grad], dim=1), "b d dh -> b dh d")
+
+                t = 0 # only use one iterations for now
+                t_vec = torch.full((opt1_input.shape[0],), t, device=opt1_input.device)
+                w1_update = opts[1](opt1_input, t_vec)[..., d:]
+                w0_update = rearrange(opts[0](opt0_input, t_vec)[..., d:], "b dh d -> b d dh")
+                w2_update = rearrange(opts[2](opt2_input, t_vec)[..., d:], "b dh d -> b d dh")
             
             w1_now = w1_now + w1_update
             w0_now = w0_now + w0_update
@@ -217,34 +223,17 @@ class FastWeightGluMLPMultihead(nn.Module):
         self.lr_fc = nn.Linear(dim, self.lr_dim * 3)
         self.base_lr_inv = inv_softplus(base_lr)
 
-        self.o_norm = RMSNorm(head_dim)
+        self.o_norm = nn.RMSNorm(head_dim, eps=1e-5, elementwise_affine=True)
 
         # learnable opt.
         self.use_learnable_opt = use_learnable_opt
         self.n_blocks_per_opt = n_blocks_per_opt
         if use_learnable_opt:
             if shared_opts is not None:
-                assert len(shared_opts) == 3, f"shared_opts should contain 3 learnable optimizers, but got {len(shared_opts)}"
+                assert len(shared_opts) >= 3, f"shared_opts should contain at least 3 learnable optimizers, but got {len(shared_opts)}"
                 self.opts = shared_opts
             else:
-                # use transformer blocks as learnable optimizers, model the d_h as the sequence dimension always.
-                self.opts = nn.ModuleList()
-                for _ in range(3):
-                    # map [B, Dh, 2D] to [B, Dh, D]
-                    opt = nn.Sequential(
-                        nn.Linear(head_dim * 2, head_dim * 4, bias=False),
-                        nn.GELU(),
-                        nn.Linear(head_dim * 4, head_dim, bias=False),
-                        RMSNorm(head_dim),
-                        *[QK_Norm_TransformerBlock(
-                            dim=head_dim,
-                            head_dim=64,
-                            use_qk_norm=True,
-                            use_positional_encoding=True,
-                        ) for _ in range(n_blocks_per_opt)],
-                    )
-                    # weight initialization will be applied in the model.py
-                    self.opts.append(opt)
+                raise NotImplementedError("shared_opts is not supported for learnable opt")
         
     def forward(self, x: torch.Tensor, info={}, *args):
         """
