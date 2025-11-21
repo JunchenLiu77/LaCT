@@ -136,11 +136,43 @@ def fast_weight_swish_glu_weight_norm_mini_batch_apply(
                 w0_update = w0_grad
                 w2_update = w2_grad
             else:
-                opt1_input = torch.cat([w1_now, w1_grad], dim=2)
-                opt0_input = rearrange(torch.cat([w0_now, w0_grad], dim=1), "b d dh -> b dh d")
-                opt2_input = rearrange(torch.cat([w2_now, w2_grad], dim=1), "b d dh -> b dh d")
+                # Add positional encoding on the sequence dimension L to the w_now part only
+                # For w1 (shape [b, dh, d])
+                L1, D1 = w1_now.shape[1], w1_now.shape[2]
+                pos1 = torch.arange(L1, device=w1_now.device, dtype=torch.float32).unsqueeze(1)
+                div1 = torch.exp(torch.arange(0, D1, 2, device=w1_now.device, dtype=torch.float32) * (-math.log(10000.0) / max(1, D1)))
+                pe1 = torch.zeros(L1, D1, device=w1_now.device, dtype=torch.float32)
+                pe1[:, 0::2] = torch.sin(pos1 * div1)
+                pe1[:, 1::2] = torch.cos(pos1 * div1)
+                pe1 = pe1.to(w1_now.dtype).unsqueeze(0)  # [1, L1, D1]
+                w1_now_pe = w1_now + pe1
+                opt1_input = torch.cat([w1_now_pe, w1_grad], dim=2)  # [b, L1, 2*D1]
 
-                t = 0 # only use one iterations for now
+                # For w0 (shape [b, d, dh] -> [b, dh, d])
+                L0, D0 = w0_now.shape[2], w0_now.shape[1]
+                pos0 = torch.arange(L0, device=w0_now.device, dtype=torch.float32).unsqueeze(1)
+                div0 = torch.exp(torch.arange(0, D0, 2, device=w0_now.device, dtype=torch.float32) * (-math.log(10000.0) / max(1, D0)))
+                pe0 = torch.zeros(L0, D0, device=w0_now.device, dtype=torch.float32)
+                pe0[:, 0::2] = torch.sin(pos0 * div0)
+                pe0[:, 1::2] = torch.cos(pos0 * div0)
+                pe0 = pe0.to(w0_now.dtype).unsqueeze(0)  # [1, L0, D0]
+                w0_now_seq = rearrange(w0_now, "b d dh -> b dh d") + pe0
+                w0_grad_seq = rearrange(w0_grad, "b d dh -> b dh d")
+                opt0_input = torch.cat([w0_now_seq, w0_grad_seq], dim=2)  # [b, L0, 2*D0]
+
+                # For w2 (shape [b, d, dh] -> [b, dh, d])
+                L2, D2 = w2_now.shape[2], w2_now.shape[1]
+                pos2 = torch.arange(L2, device=w2_now.device, dtype=torch.float32).unsqueeze(1)
+                div2 = torch.exp(torch.arange(0, D2, 2, device=w2_now.device, dtype=torch.float32) * (-math.log(10000.0) / max(1, D2)))
+                pe2 = torch.zeros(L2, D2, device=w2_now.device, dtype=torch.float32)
+                pe2[:, 0::2] = torch.sin(pos2 * div2)
+                pe2[:, 1::2] = torch.cos(pos2 * div2)
+                pe2 = pe2.to(w2_now.dtype).unsqueeze(0)  # [1, L2, D2]
+                w2_now_seq = rearrange(w2_now, "b d dh -> b dh d") + pe2
+                w2_grad_seq = rearrange(w2_grad, "b d dh -> b dh d")
+                opt2_input = torch.cat([w2_now_seq, w2_grad_seq], dim=2)  # [b, L2, 2*D2]
+
+                t = 0.0 # only use one iterations for now
                 t_vec = torch.full((opt1_input.shape[0],), t, device=opt1_input.device)
                 w1_update = opts[1](opt1_input, t_vec)[..., d:]
                 w0_update = rearrange(opts[0](opt0_input, t_vec)[..., d:], "b dh d -> b d dh")

@@ -22,6 +22,7 @@ from model import LaCTLVSM
 from inference import get_turntable_cameras_with_zoom_in, get_interpolated_cameras
 from PIL import Image
 import imageio
+import json
 
 def main():
     parser = argparse.ArgumentParser()
@@ -202,7 +203,34 @@ def main():
     )
 
     if args.test_every > 0:
-        test_set = NVSDataset(args.data_path, args.num_all_views, tuple(args.image_size), sorted_indices=True, scene_pose_normalize=args.scene_pose_normalize)
+        # Load fixed test indices
+        num_total_needed = args.num_input_views + args.num_target_views
+        fixed_indices_filename = f"test_indices_in{args.num_input_views}_tar{args.num_target_views}.json"
+        fixed_indices_path = os.path.join("data_example", fixed_indices_filename)
+        
+        assert os.path.exists(fixed_indices_path), (
+            f"Fixed test indices file not found at {fixed_indices_path}. "
+            f"Please run `python lact_nvs/generate_indices.py --data_path {args.data_path} "
+            f"--num_input_views {args.num_input_views} --num_target_views {args.num_target_views}` first."
+        )
+        
+        if dist.get_rank() == 0:
+            print(f"Loading fixed test indices from {fixed_indices_path}")
+            
+        with open(fixed_indices_path, "r") as f:
+            test_indices_map = json.load(f)
+
+        # Use num_total_needed as num_views to ensure we get exactly what we put in the map
+        num_views_for_dataset = args.num_input_views + args.num_target_views
+
+        test_set = NVSDataset(
+            args.data_path, 
+            num_views_for_dataset, 
+            tuple(args.image_size), 
+            sorted_indices=False,  # Important: false to preserve Input/Target block ordering
+            scene_pose_normalize=args.scene_pose_normalize,
+            fixed_indices=test_indices_map
+        )
         test_sampler = DistributedSampler(test_set)
         test_dataloader_seed_generator = torch.Generator()
         test_dataloader_seed_generator.manual_seed(rank_specific_seed)
@@ -267,24 +295,19 @@ def main():
                 test_dir = f"output/{args.expname}/{now_iters:07d}_test"
                 os.makedirs(test_dir, exist_ok=True)
                 print(f"[{dist.get_rank():02d}, {ddp_local_rank:02d}] Testing from iter {now_iters:07d}...")
+
+                # Collect all test results for this rank
+                rank_test_results = []
+
                 for sample_idx, data_dict in enumerate(test_iter):
                     print(f"[{dist.get_rank():02d}, {ddp_local_rank:02d}] Testing sample {sample_idx:07d}...")
                     if args.first_n is not None and sample_idx >= args.first_n:
                         break
+                    indices = data_dict["indices"]
                     scene_names = data_dict["scene_name"]
                     data_dict = {key: value.cuda() for key, value in data_dict.items() if isinstance(value, torch.Tensor)}
-                    if args.scene_inference:
-                        # Randomly select input views and use remaining as target
-                        total_views = data_dict["image"].shape[1]
-                        all_indices = torch.randperm(total_views)
-                        input_indices = torch.sort(all_indices[:args.num_input_views])[0]   # Sort for video rendering only; model forward is permutation-invariant
-                        target_indices = all_indices[-args.num_target_views:]
-                        
-                        input_data_dict = {key: value[:, input_indices] for key, value in data_dict.items()}
-                        target_data_dict = {key: value[:, target_indices] for key, value in data_dict.items()}
-                    else:
-                        input_data_dict = {key: value[:, :args.num_input_views] for key, value in data_dict.items()}
-                        target_data_dict = {key: value[:, -args.num_target_views:] for key, value in data_dict.items()}
+                    input_data_dict = {key: value[:, :args.num_input_views] for key, value in data_dict.items()}
+                    target_data_dict = {key: value[:, -args.num_target_views:] for key, value in data_dict.items()}
 
                     with torch.autocast(dtype=torch.bfloat16, device_type="cuda", enabled=True) and torch.no_grad():
                         rendering = model(input_data_dict, target_data_dict)
@@ -315,6 +338,27 @@ def main():
                             psnr = -10.0 * torch.log10(F.mse_loss(rendered, target)).item()
                             lpips_loss = lpips_loss_module(rendered, target, normalize=True).mean().item()
 
+                            # Determine indices used for input and target
+                            sample_indices = indices[batch_idx].cpu().tolist()
+                            total_views_count = len(sample_indices)
+                            input_indices_local = list(range(args.num_input_views))
+                            target_indices_local = list(range(total_views_count - args.num_target_views, total_views_count))
+
+                            # Map local indices (0..N-1) to original dataset indices
+                            # sample_indices contains the original indices corresponding to positions 0..N-1
+                            # Sort them for the output JSON as requested
+                            input_indices_original = sorted([sample_indices[i] for i in input_indices_local])
+                            target_indices_original = sorted([sample_indices[i] for i in target_indices_local])
+
+                            # Store metrics
+                            rank_test_results.append({
+                                "scene_name": scene_name,
+                                "psnr": psnr,
+                                "lpips": lpips_loss,
+                                "input_indices": input_indices_original,
+                                "target_indices": target_indices_original
+                            })
+
                             # Collect all images for this batch
                             rendered_images = []
                             target_images = []
@@ -332,9 +376,6 @@ def main():
                             # Save the concatenated image
                             Image.fromarray(combined_image).save(os.path.join(scene_dir, f"sample_{sample_idx:06d}_batch_{batch_idx:02d}.png"))
 
-                            # Log the metrics as csv file
-                            with open(os.path.join(scene_dir, "metrics.csv"), "a") as f:
-                                f.write(f"{scene_name},{psnr:.2f},{lpips_loss:.4f}\n")
                         
                         # Rendering a video to circularly rotate the camera views
                         # if args.scene_inference:
@@ -365,31 +406,36 @@ def main():
                 torch.cuda.empty_cache()
                 dist.barrier()
 
+                # Collate metrics from all ranks and dump one json only from the main rank
+                # Use dist.all_gather_object to collect results from all ranks
+                gathered_results = [None for _ in range(dist.get_world_size())]
+                dist.all_gather_object(gathered_results, rank_test_results)
+
                 # Compute average metrics at rank 0
                 if dist.get_rank() == 0:
-                    scenes = os.listdir(test_dir)
+                    # Aggregate all results
+                    all_results = []
                     psnr_list = []
                     lpips_list = []
-                    scene_names = []
-                    for scene in scenes:
-                        scene_dir = os.path.join(test_dir, scene)
-                        metrics_path = os.path.join(scene_dir, "metrics.csv")
-                        if os.path.exists(metrics_path):
-                            metrics = np.loadtxt(metrics_path, delimiter=",", dtype=str)
-                            scene_names.append(metrics[0])
-                            psnr_list.append(np.array(metrics[1], dtype=np.float32).mean())
-                            lpips_list.append(np.array(metrics[2], dtype=np.float32).mean())
+                    
+                    for rank_results in gathered_results:
+                        all_results.extend(rank_results)
+                        for res in rank_results:
+                            psnr_list.append(res["psnr"])
+                            lpips_list.append(res["lpips"])
+
                     avg_psnr = np.array(psnr_list, dtype=np.float32).mean()
                     avg_lpips = np.array(lpips_list, dtype=np.float32).mean()
                     
-                    # log in csv file
-                    with open(os.path.join(test_dir, "metrics.csv"), "a") as f:
-                        # scene_name,psnr,lpips
-                        f.write("scene_name,psnr,lpips\n")
-                        for scene_name, psnr_val, lpips_val in zip(scene_names, psnr_list, lpips_list):
-                            f.write(f"{scene_name},{psnr_val:.2f},{lpips_val:.4f}\n")
-                        # average psnr and lpips
-                        f.write(f"average,{avg_psnr:.2f},{avg_lpips:.4f}\n")
+                    # Save aggregated results to metrics.json
+                    final_metrics = {
+                        "average_psnr": float(avg_psnr),
+                        "average_lpips": float(avg_lpips),
+                        "scene_results": all_results
+                    }
+                    
+                    with open(os.path.join(test_dir, "metrics.json"), "w") as f:
+                        json.dump(final_metrics, f, indent=4)
                     
                     # log in wandb
                     print(f"[{now_iters:07d}] Average PSNR = {avg_psnr:.2f}, Average LPIPS = {avg_lpips:.4f}")
