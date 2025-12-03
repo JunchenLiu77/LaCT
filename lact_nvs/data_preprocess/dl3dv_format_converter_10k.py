@@ -199,37 +199,51 @@ def main():
     # Define paths
     current_dir = Path(__file__).parent
     data_example_dir = current_dir.parent / 'data_example'
-    benchmark_dir = data_example_dir / 'dl3dv_10k/4K'
+    
+    # List of subfolders to process
+    subfolders_to_process = ['1K', '2K', '3K', '4K', '5K', '6K', '7K', '8K', '9K', '10K', '11K']
+    
     output_json = data_example_dir / 'dl3dv_10k_sample_data_path.json'
+    output_base_dir = data_example_dir / 'dl3dv_10k_processed'  # Output directory
     
-    # Optional: Define different input and output directories
-    input_dir = benchmark_dir  # Can be changed to different input directory
-    output_base_dir = data_example_dir / 'dl3dv_10k_processed'  # Different output directory
-    
-    if not input_dir.exists():
-        print(f"Error: {input_dir} does not exist")
-        return
+    converted_count = 0
     
     print("Starting DL3DV format conversion...")
-    print(f"Input directory: {input_dir}")
     print(f"Output directory: {output_base_dir}")
+
+    for subfolder in subfolders_to_process:
+        benchmark_dir = data_example_dir / f'dl3dv_10k/{subfolder}'
+        input_dir = benchmark_dir
+        
+        if not input_dir.exists():
+            print(f"Error: {input_dir} does not exist, skipping...")
+            continue
+        
+        print(f"Processing subfolder: {subfolder}")
+        print(f"Input directory: {input_dir}")
+        
+        # Convert each folder
+        for item in input_dir.iterdir():
+            if item.is_dir() and not item.name.startswith('.'):
+                # Check if scene is already processed in output directory
+                scene_output_dir = output_base_dir / item.name
+                if scene_output_dir.exists() and (scene_output_dir / 'opencv_cameras.json').exists():
+                    print(f"Skipping {item.name} (already processed)")
+                    converted_count += 1
+                    continue
+
+                print(f"Processing {item.name}...")
+                
+                # Create output directory for this scene
+                scene_output_dir.mkdir(parents=True, exist_ok=True)
+                
+                if convert_folder(item, scene_output_dir):
+                    converted_count += 1
     
-    # Convert each folder
-    converted_count = 0
-    for item in input_dir.iterdir():
-        if item.is_dir() and not item.name.startswith('.'):
-            print(f"Processing {item.name}...")
-            
-            # Create output directory for this scene
-            scene_output_dir = output_base_dir / item.name
-            scene_output_dir.mkdir(parents=True, exist_ok=True)
-            
-            if convert_folder(item, scene_output_dir):
-                converted_count += 1
-    
-    print(f"Converted {converted_count} folders")
+    print(f"Converted {converted_count} folders in total")
     
     # Create sample data path JSON (pointing to the new output directory)
+    # Note: this will index all folders in output_base_dir, effectively merging all processed subfolders
     create_sample_data_path_json(output_base_dir, output_json)
     
     print("Conversion completed successfully!")
