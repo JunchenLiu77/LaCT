@@ -146,6 +146,7 @@ def fast_weight_swish_glu_weight_norm_mini_batch_apply(
                 pe1[:, 1::2] = torch.cos(pos1 * div1)
                 pe1 = pe1.to(w1_now.dtype).unsqueeze(0)  # [1, L1, D1]
                 w1_now_pe = w1_now + pe1
+                # w1_now_pe = torch.zeros_like(w1_now) + pe1
                 opt1_input = torch.cat([w1_now_pe, w1_grad], dim=2)  # [b, L1, 2*D1]
 
                 # For w0 (shape [b, d, dh] -> [b, dh, d])
@@ -157,6 +158,7 @@ def fast_weight_swish_glu_weight_norm_mini_batch_apply(
                 pe0[:, 1::2] = torch.cos(pos0 * div0)
                 pe0 = pe0.to(w0_now.dtype).unsqueeze(0)  # [1, L0, D0]
                 w0_now_seq = rearrange(w0_now, "b d dh -> b dh d") + pe0
+                # w0_now_seq = rearrange(torch.zeros_like(w0_now), "b d dh -> b dh d") + pe0
                 w0_grad_seq = rearrange(w0_grad, "b d dh -> b dh d")
                 opt0_input = torch.cat([w0_now_seq, w0_grad_seq], dim=2)  # [b, L0, 2*D0]
 
@@ -169,6 +171,7 @@ def fast_weight_swish_glu_weight_norm_mini_batch_apply(
                 pe2[:, 1::2] = torch.cos(pos2 * div2)
                 pe2 = pe2.to(w2_now.dtype).unsqueeze(0)  # [1, L2, D2]
                 w2_now_seq = rearrange(w2_now, "b d dh -> b dh d") + pe2
+                # w2_now_seq = rearrange(torch.zeros_like(w2_now), "b d dh -> b dh d") + pe2
                 w2_grad_seq = rearrange(w2_grad, "b d dh -> b dh d")
                 opt2_input = torch.cat([w2_now_seq, w2_grad_seq], dim=2)  # [b, L2, 2*D2]
 
