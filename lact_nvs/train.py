@@ -335,7 +335,14 @@ def main():
                             # Compute metrics
                             target = target_data_dict["image"][batch_idx]
                             rendered = rendering[batch_idx]
-                            psnr = -10.0 * torch.log10(F.mse_loss(rendered, target)).item()
+                            
+                            # Calculate PSNR per view and then average (Mean of Metrics), 
+                            # instead of PSNR of average MSE (Metric of Mean Error).
+                            # This aligns with LPIPS calculation and standard evaluation protocols.
+                            mse_per_view = F.mse_loss(rendered, target, reduction='none').mean(dim=[1, 2, 3])
+                            psnr_per_view = -10.0 * torch.log10(mse_per_view)
+                            psnr = psnr_per_view.mean().item()
+
                             lpips_loss = lpips_loss_module(rendered, target, normalize=True).mean().item()
 
                             # Determine indices used for input and target
