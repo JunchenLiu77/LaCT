@@ -1,0 +1,29 @@
+patch_size: 8
+dim: 768
+layers: 12
+use_shared_opts: false
+
+block_config:
+  - type: model.SelfAttention
+    length_dim: l
+    params:
+      head_dim: 64
+      use_qk_norm: true
+  - type: lact_ttt.FastWeightGluMLPMultihead
+    length_dim: vl
+    params:
+      head_dim: 768 # 256
+      inter_multi: 2
+      base_lr: 0.01
+      muon_update_steps: 5
+      use_learnable_opt: false
+      opt_type: "dit"
+      n_blocks_per_opt: 1
+      opt_hidden_dim: 256
+      residual: true
+      normalize_weight: true
+      output_norm_method: "none"
+  - type: model.MLP
+    length_dim: vl
+    params:
+      inter_multi: 4
