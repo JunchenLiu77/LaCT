@@ -52,16 +52,25 @@ def main():
 
     # Optimizer
     parser.add_argument("--lr", type=float, default=1e-4)
+    parser.add_argument("--lr_opts", type=float, default=None)
     parser.add_argument("--warmup", type=int, default=4000)
     parser.add_argument("--steps", type=int, default=80000)
     parser.add_argument("--weight_decay", type=float, default=0.05)
     parser.add_argument("--lpips_start", type=int, default=5000, help="Iteration to start LPIPS loss")
+    parser.add_argument("--grad_clip", type=float, default=1.0, help="Gradient clipping value")
 
     # Model
     parser.add_argument("--use_learnable_opt", action="store_true")
+    parser.add_argument("--opt_type", type=str, default="", help="Type of optimizer")
+    parser.add_argument("--residual", action="store_true")
+    parser.add_argument("--no_residual", action="store_true")
+    parser.add_argument("--normalize_weight", action="store_true")
+    parser.add_argument("--no_normalize_weight", action="store_true")
+    parser.add_argument("--opt_hidden_dim", type=int, default=256)
     parser.add_argument("--n_blocks_per_opt", type=int, default=2)
     parser.add_argument("--only_train_opts", action="store_true")
     parser.add_argument("--use_shared_opts", action="store_true")
+    parser.add_argument("--output_norm_method", type=str, default="none", choices=["none", "mean_std", "affine"])
 
     args = parser.parse_args()
     model_config = omegaconf.OmegaConf.load(args.config)
@@ -73,6 +82,24 @@ def main():
         model_config.block_config[1]["params"]["n_blocks_per_opt"] = args.n_blocks_per_opt
     if hasattr(args, "use_shared_opts") and args.use_shared_opts:
         model_config.use_shared_opts = args.use_shared_opts
+    if hasattr(args, "opt_type") and args.opt_type:
+        model_config.block_config[1]["params"]["opt_type"] = args.opt_type
+    if hasattr(args, "residual") and args.residual:
+        assert not (hasattr(args, "no_residual") and args.no_residual), "residual and no-residual cannot be set at the same time"
+        model_config.block_config[1]["params"]["residual"] = args.residual
+    if hasattr(args, "no_residual") and args.no_residual:
+        assert not (hasattr(args, "residual") and args.residual), "residual and no-residual cannot be set at the same time"
+        model_config.block_config[1]["params"]["residual"] = False
+    if hasattr(args, "normalize_weight") and args.normalize_weight:
+        assert not (hasattr(args, "no_normalize_weight") and args.no_normalize_weight), "normalize_weight and no-normalize_weight cannot be set at the same time"
+        model_config.block_config[1]["params"]["normalize_weight"] = args.normalize_weight
+    if hasattr(args, "no_normalize_weight") and args.no_normalize_weight:
+        assert not (hasattr(args, "normalize_weight") and args.normalize_weight), "normalize_weight and no-normalize_weight cannot be set at the same time"
+        model_config.block_config[1]["params"]["normalize_weight"] = False
+    if hasattr(args, "opt_hidden_dim") and args.opt_hidden_dim:
+        model_config.block_config[1]["params"]["opt_hidden_dim"] = args.opt_hidden_dim
+    if hasattr(args, "output_norm_method") and args.output_norm_method:
+        model_config.block_config[1]["params"]["output_norm_method"] = args.output_norm_method
     output_dir = f"output/{args.expname}"
     os.makedirs(output_dir, exist_ok=True)
 
@@ -93,7 +120,8 @@ def main():
     model = LaCTLVSM(**model_config).cuda()
 
     # Config learnable params
-    learnable_params = []
+    opts_params = []
+    other_params = []
     learnable_param_names = []
     frozen_param_names = []
     learnable_params_count = 0
@@ -101,7 +129,10 @@ def main():
     
     for n, p in model.named_parameters():
         if not args.only_train_opts or ("opts" in n):
-            learnable_params.append(p)
+            if "opts" in n:
+                opts_params.append(p)
+            else:
+                other_params.append(p)
             learnable_param_names.append(n)
             learnable_params_count += p.numel()
             p.requires_grad = True
@@ -111,13 +142,24 @@ def main():
             frozen_params_count += p.numel()
     
     # Config optimizer
-    decay_params = [p for p in learnable_params if p.dim() >= 2]
-    nodecay_params = [p for p in learnable_params if p.dim() < 2]
-    optim_groups = [
-        {"params": decay_params, "weight_decay": args.weight_decay},
-        {"params": nodecay_params, "weight_decay": 0.0},
-    ]
-    optimizer = torch.optim.AdamW(optim_groups, lr=args.lr, betas=(0.9, 0.95), fused=True)
+    optim_groups = []
+    
+    # Regular parameters
+    if other_params:
+        decay_params = [p for p in other_params if p.dim() >= 2]
+        nodecay_params = [p for p in other_params if p.dim() < 2]
+        optim_groups.append({"params": decay_params, "weight_decay": args.weight_decay, "lr": args.lr})
+        optim_groups.append({"params": nodecay_params, "weight_decay": 0.0, "lr": args.lr})
+
+    # Opts parameters
+    if opts_params:
+        lr_opts = args.lr_opts if args.lr_opts is not None else args.lr
+        decay_params = [p for p in opts_params if p.dim() >= 2]
+        nodecay_params = [p for p in opts_params if p.dim() < 2]
+        optim_groups.append({"params": decay_params, "weight_decay": args.weight_decay, "lr": lr_opts})
+        optim_groups.append({"params": nodecay_params, "weight_decay": 0.0, "lr": lr_opts})
+
+    optimizer = torch.optim.AdamW(optim_groups, betas=(0.9, 0.95), fused=True)
     lr_scheduler = get_cosine_schedule_with_warmup(
         optimizer,
         num_warmup_steps=args.warmup,
@@ -126,7 +168,15 @@ def main():
 
     # Load checkpoint
     now_iters = 0
-    for try_load_path in [args.load]:
+    load_paths = []
+    # First try to resume from the output directory
+    if os.path.exists(output_dir):
+        load_paths.append(output_dir)
+    # Then try the explicitly provided load path
+    if args.load:
+        load_paths.append(args.load)
+
+    for try_load_path in load_paths:
         if try_load_path is None: continue
         try:
             if os.path.isdir(try_load_path):
@@ -144,7 +194,8 @@ def main():
             lr_scheduler.load_state_dict(checkpoint["lr_scheduler"])
             now_iters = checkpoint["now_iters"]
             break
-        except:
+        except Exception as e:
+            print(f"[{dist.get_rank():02d}, {ddp_local_rank:02d}] Failed to load from {try_load_path}: {e}")
             continue
             
     model = DDP(model, device_ids=[ddp_local_rank])
@@ -261,9 +312,17 @@ def main():
         print(f"Starting training from iter {now_iters}...")
         
         # Initialize wandb
+        wandb_id = None
+        wandb_id_path = os.path.join(output_dir, "wandb_id.txt")
+        if os.path.exists(wandb_id_path):
+            with open(wandb_id_path, "r") as f:
+                wandb_id = f.read().strip()
+            print(f"Resuming wandb run with id {wandb_id}")
+
         wandb.init(
             project="lact-nvs",
             name=args.expname,
+            id=wandb_id,
             config={
                 "config": args.config,
                 "bs_per_gpu": args.bs_per_gpu,
@@ -280,8 +339,13 @@ def main():
                 "compile": args.compile,
                 "actckpt": args.actckpt,
             },
-            resume="allow" if now_iters > 0 else None,
+            resume="allow",
         )
+        if wandb_id is None:
+            wandb_id = wandb.run.id
+            with open(wandb_id_path, "w") as f:
+                f.write(wandb_id)
+        
         wandb.watch(model, log="all", log_freq=args.log_every)
         print(f"Wandb initialized")
 
@@ -471,11 +535,11 @@ def main():
             # Gradident safeguard
             skip_optimizer_step = False
             if now_iters > 1000:
-                global_grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0).item()
+                global_grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip).item()
 
                 if not math.isfinite(global_grad_norm):
                     skip_optimizer_step = True
-                elif global_grad_norm > 4.0:
+                elif global_grad_norm > 4 * args.grad_clip:
                     skip_optimizer_step = True
 
             if not skip_optimizer_step:
@@ -511,6 +575,16 @@ def main():
                         "epoch": epoch,
                     }, f"{output_dir}/model_{now_iters:07d}.pth")
                     print(f"[{now_iters:07d}] Checkpoint saved to {output_dir}/model_{now_iters:07d}.pth")
+
+                    # Clean up old checkpoints
+                    # only keep the latest 4 ckpts and dont delete those ckpts that are multiply of 10K
+                    checkpoints = [f for f in os.listdir(output_dir) if f.startswith("model_") and f.endswith(".pth")]
+                    checkpoints = sorted(checkpoints, key=lambda x: int(x.split("_")[1].split(".")[0]))
+                    for ckpt in checkpoints[:-4]:
+                        iter_num = int(ckpt.split("_")[1].split(".")[0])
+                        if iter_num % 10000 != 0:
+                            os.remove(os.path.join(output_dir, ckpt))
+                            print(f"Removed old checkpoint {ckpt}")
             
             if now_iters == args.steps:
                 break
