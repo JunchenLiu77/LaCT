@@ -186,23 +186,40 @@ class LaCTLVSM(nn.Module):
         opts = None
         if use_shared_opts and block_config[1]["params"]["use_learnable_opt"]:
             # if use_shared_opts, we will instantiate one set of opts here and share it across all blocks
-            head_dim = block_config[1]["params"]["head_dim"]
-            opts = nn.ModuleList()
-            from dit import DiT
+            if block_config[1]["params"]["opt_type"] == "dit":
+                head_dim = block_config[1]["params"]["head_dim"]
+                opts = nn.ModuleList()
+                from dit import DiT
 
-            for _ in range(3):
-                # use DiT to update the fast weight iteratively, map [B, Dh, 2D] to [B, Dh, 2D]
-                opt = DiT(
-                    hidden_size=head_dim * 2,
-                    depth=block_config[1]["params"]["n_blocks_per_opt"],
-                    num_heads=head_dim * 2 // 64,
-                    mlp_ratio=4.0
-                )
-                # weight initialization will be applied in the model.py
-                opts.append(opt)
+                for _ in range(3):
+                    # use DiT to update the fast weight iteratively, map [B, Dh, 2D] to [B, Dh, 2D]
+                    opt = DiT(
+                        hidden_size=head_dim * 2,
+                        depth=block_config[1]["params"]["n_blocks_per_opt"],
+                        num_heads=head_dim * 2 // 64,
+                        mlp_ratio=4.0
+                    )
+                    # weight initialization will be applied in the model.py
+            else:
+                # instantiate a set of small MLPs map [..., 2] to [..., 1]
+                opts = nn.ModuleList()
+                n_layers = block_config[1]["params"]["n_blocks_per_opt"]
+                hidden_dim = block_config[1]["params"]["opt_hidden_dim"]
+                for _ in range(3):
+                    if n_layers == 1:
+                        opt = nn.Linear(2, 1, bias=False)
+                    else:
+                        opt = [nn.Linear(2, hidden_dim, bias=False), nn.ReLU()]
+                        for _ in range(n_layers - 2):
+                            opt.append(nn.Linear(hidden_dim, hidden_dim, bias=False))
+                            opt.append(nn.ReLU())
+                        opt.append(nn.Linear(hidden_dim, 1, bias=False))
+                        opt = nn.Sequential(*opt)
+                    opts.append(opt)
             
         self.blocks = nn.ModuleList([
-            Block(dim=self.dim, bias=False, block_config=block_config, shared_opts=opts)
+            Block(
+                dim=self.dim, bias=False, block_config=block_config, shared_opts=opts)
             for _ in range(layers)
         ])
 
@@ -215,7 +232,7 @@ class LaCTLVSM(nn.Module):
         # apply special scaled init to the residual projections, per GPT-2 paper
         self.apply(_init_weights)
 
-        if opts is not None:
+        if opts is not None and block_config[1]["params"]["opt_type"] == "dit":
             # re-initialize the weights of DiT opts
             for opt in opts:
                 opt.initialize_weights()

@@ -81,7 +81,11 @@ def fast_weight_swish_glu_weight_norm_mini_batch_apply(
     ttt_ua_order: list,
     muon_update_steps: int = 0,
     use_learnable_opt: bool = False,
+    opt_type: str = "",
     opts: nn.ModuleList = None,
+    residual: bool = True,
+    normalize_weight: bool = True,
+    output_norm_method: str = "none",
 ):
     """
     Note:
@@ -95,11 +99,21 @@ def fast_weight_swish_glu_weight_norm_mini_batch_apply(
     v: [b, l, d]
     lr0, lr1, lr2: [b, l, 1]
     use_learnable_opt: if True, the opts will be used to update the weights.
+    opt_type: "dit" or "mlp". If "dit", use the dit optimizer to update the weights. If "mlp", use a simple MLP to update the weights.
     opts: if use_learnable_opt is True, this should contains three learnable optimizers to update w0, w1, w2.
+    residual: if True, use the residual update for the weights.
+    normalize_weight: if True, normalize the weights after updating.
+    output_norm_method: "none", "mean_std" or "affine". Method to normalize the output.
     """
-    w0_norm = w0.detach().norm(dim=1, keepdim=True)
-    w1_norm = w1.detach().norm(dim=1, keepdim=True)
-    w2_norm = w2.detach().norm(dim=1, keepdim=True)
+    if use_learnable_opt:
+        assert opt_type in ["dit", "mlp"], f"opt_type should be 'dit' or 'mlp', but got {opt_type}"
+        assert opts is not None, "opts should be provided if use_learnable_opt is True"
+        assert len(opts) == 3, "opts should contain 3 learnable optimizers"
+
+    if normalize_weight:
+        w0_norm = w0.detach().norm(dim=1, keepdim=True)
+        w1_norm = w1.detach().norm(dim=1, keepdim=True)
+        w2_norm = w2.detach().norm(dim=1, keepdim=True)
 
     d = w0.shape[1]
 
@@ -136,59 +150,83 @@ def fast_weight_swish_glu_weight_norm_mini_batch_apply(
                 w0_update = w0_grad
                 w2_update = w2_grad
             else:
-                # Add positional encoding on the sequence dimension L to the w_now part only
-                # For w1 (shape [b, dh, d])
-                L1, D1 = w1_now.shape[1], w1_now.shape[2]
-                pos1 = torch.arange(L1, device=w1_now.device, dtype=torch.float32).unsqueeze(1)
-                div1 = torch.exp(torch.arange(0, D1, 2, device=w1_now.device, dtype=torch.float32) * (-math.log(10000.0) / max(1, D1)))
-                pe1 = torch.zeros(L1, D1, device=w1_now.device, dtype=torch.float32)
-                pe1[:, 0::2] = torch.sin(pos1 * div1)
-                pe1[:, 1::2] = torch.cos(pos1 * div1)
-                pe1 = pe1.to(w1_now.dtype).unsqueeze(0)  # [1, L1, D1]
-                w1_now_pe = w1_now + pe1
-                # w1_now_pe = torch.zeros_like(w1_now) + pe1
-                opt1_input = torch.cat([w1_now_pe, w1_grad], dim=2)  # [b, L1, 2*D1]
+                if opt_type == "dit":
+                    # Add positional encoding on the sequence dimension L to the w_now part only
+                    # For w1 (shape [b, dh, d])
+                    L1, D1 = w1_now.shape[1], w1_now.shape[2]
+                    pos1 = torch.arange(L1, device=w1_now.device, dtype=torch.float32).unsqueeze(1)
+                    div1 = torch.exp(torch.arange(0, D1, 2, device=w1_now.device, dtype=torch.float32) * (-math.log(10000.0) / max(1, D1)))
+                    pe1 = torch.zeros(L1, D1, device=w1_now.device, dtype=torch.float32)
+                    pe1[:, 0::2] = torch.sin(pos1 * div1)
+                    pe1[:, 1::2] = torch.cos(pos1 * div1)
+                    pe1 = pe1.to(w1_now.dtype).unsqueeze(0)  # [1, L1, D1]
+                    w1_now_pe = w1_now + pe1
+                    # w1_now_pe = torch.zeros_like(w1_now) + pe1
+                    opt1_input = torch.cat([w1_now_pe, w1_grad], dim=2)  # [b, L1, 2*D1]
 
-                # For w0 (shape [b, d, dh] -> [b, dh, d])
-                L0, D0 = w0_now.shape[2], w0_now.shape[1]
-                pos0 = torch.arange(L0, device=w0_now.device, dtype=torch.float32).unsqueeze(1)
-                div0 = torch.exp(torch.arange(0, D0, 2, device=w0_now.device, dtype=torch.float32) * (-math.log(10000.0) / max(1, D0)))
-                pe0 = torch.zeros(L0, D0, device=w0_now.device, dtype=torch.float32)
-                pe0[:, 0::2] = torch.sin(pos0 * div0)
-                pe0[:, 1::2] = torch.cos(pos0 * div0)
-                pe0 = pe0.to(w0_now.dtype).unsqueeze(0)  # [1, L0, D0]
-                w0_now_seq = rearrange(w0_now, "b d dh -> b dh d") + pe0
-                # w0_now_seq = rearrange(torch.zeros_like(w0_now), "b d dh -> b dh d") + pe0
-                w0_grad_seq = rearrange(w0_grad, "b d dh -> b dh d")
-                opt0_input = torch.cat([w0_now_seq, w0_grad_seq], dim=2)  # [b, L0, 2*D0]
+                    # For w0 (shape [b, d, dh] -> [b, dh, d])
+                    L0, D0 = w0_now.shape[2], w0_now.shape[1]
+                    pos0 = torch.arange(L0, device=w0_now.device, dtype=torch.float32).unsqueeze(1)
+                    div0 = torch.exp(torch.arange(0, D0, 2, device=w0_now.device, dtype=torch.float32) * (-math.log(10000.0) / max(1, D0)))
+                    pe0 = torch.zeros(L0, D0, device=w0_now.device, dtype=torch.float32)
+                    pe0[:, 0::2] = torch.sin(pos0 * div0)
+                    pe0[:, 1::2] = torch.cos(pos0 * div0)
+                    pe0 = pe0.to(w0_now.dtype).unsqueeze(0)  # [1, L0, D0]
+                    w0_now_seq = rearrange(w0_now, "b d dh -> b dh d") + pe0
+                    # w0_now_seq = rearrange(torch.zeros_like(w0_now), "b d dh -> b dh d") + pe0
+                    w0_grad_seq = rearrange(w0_grad, "b d dh -> b dh d")
+                    opt0_input = torch.cat([w0_now_seq, w0_grad_seq], dim=2)  # [b, L0, 2*D0]
 
-                # For w2 (shape [b, d, dh] -> [b, dh, d])
-                L2, D2 = w2_now.shape[2], w2_now.shape[1]
-                pos2 = torch.arange(L2, device=w2_now.device, dtype=torch.float32).unsqueeze(1)
-                div2 = torch.exp(torch.arange(0, D2, 2, device=w2_now.device, dtype=torch.float32) * (-math.log(10000.0) / max(1, D2)))
-                pe2 = torch.zeros(L2, D2, device=w2_now.device, dtype=torch.float32)
-                pe2[:, 0::2] = torch.sin(pos2 * div2)
-                pe2[:, 1::2] = torch.cos(pos2 * div2)
-                pe2 = pe2.to(w2_now.dtype).unsqueeze(0)  # [1, L2, D2]
-                w2_now_seq = rearrange(w2_now, "b d dh -> b dh d") + pe2
-                # w2_now_seq = rearrange(torch.zeros_like(w2_now), "b d dh -> b dh d") + pe2
-                w2_grad_seq = rearrange(w2_grad, "b d dh -> b dh d")
-                opt2_input = torch.cat([w2_now_seq, w2_grad_seq], dim=2)  # [b, L2, 2*D2]
+                    # For w2 (shape [b, d, dh] -> [b, dh, d])
+                    L2, D2 = w2_now.shape[2], w2_now.shape[1]
+                    pos2 = torch.arange(L2, device=w2_now.device, dtype=torch.float32).unsqueeze(1)
+                    div2 = torch.exp(torch.arange(0, D2, 2, device=w2_now.device, dtype=torch.float32) * (-math.log(10000.0) / max(1, D2)))
+                    pe2 = torch.zeros(L2, D2, device=w2_now.device, dtype=torch.float32)
+                    pe2[:, 0::2] = torch.sin(pos2 * div2)
+                    pe2[:, 1::2] = torch.cos(pos2 * div2)
+                    pe2 = pe2.to(w2_now.dtype).unsqueeze(0)  # [1, L2, D2]
+                    w2_now_seq = rearrange(w2_now, "b d dh -> b dh d") + pe2
+                    # w2_now_seq = rearrange(torch.zeros_like(w2_now), "b d dh -> b dh d") + pe2
+                    w2_grad_seq = rearrange(w2_grad, "b d dh -> b dh d")
+                    opt2_input = torch.cat([w2_now_seq, w2_grad_seq], dim=2)  # [b, L2, 2*D2]
 
-                t = 0.0 # only use one iterations for now
-                t_vec = torch.full((opt1_input.shape[0],), t, device=opt1_input.device)
-                w1_update = opts[1](opt1_input, t_vec)[..., d:]
-                w0_update = rearrange(opts[0](opt0_input, t_vec)[..., d:], "b dh d -> b d dh")
-                w2_update = rearrange(opts[2](opt2_input, t_vec)[..., d:], "b dh d -> b d dh")
-            
-            w1_now = w1_now + w1_update
-            w0_now = w0_now + w0_update
-            w2_now = w2_now + w2_update
+                    t = 0.0 # only use one iterations for now
+                    t_vec = torch.full((opt1_input.shape[0],), t, device=opt1_input.device)
+                    w1_update = opts[1](opt1_input, t_vec)[..., d:]
+                    w0_update = rearrange(opts[0](opt0_input, t_vec)[..., d:], "b dh d -> b d dh")
+                    w2_update = rearrange(opts[2](opt2_input, t_vec)[..., d:], "b dh d -> b d dh")
 
-            # do weight norm here
-            w0_now = w0_now / (w0_now.norm(dim=1, keepdim=True) + 1e-5) * w0_norm
-            w1_now = w1_now / (w1_now.norm(dim=1, keepdim=True) + 1e-5) * w1_norm
-            w2_now = w2_now / (w2_now.norm(dim=1, keepdim=True) + 1e-5) * w2_norm
+                elif opt_type == "mlp":
+                    # use a simple MLP to update the weights
+                    L1, D1 = w1_now.shape[1], w1_now.shape[2]
+                    opt1_input = torch.stack([w1_now, w1_grad], dim=-1).reshape(-1, 2)   # [b * L1 * D1, 2]
+                    w1_update = opts[1](opt1_input) # [b * L1 * D1, 2] -> [b * L1 * D1, 1]
+                    w1_update = w1_update.reshape(w1_now.shape[0], L1, D1) # [b * L1 * D1, 1] -> [b, L1, D1]
+
+                    L0, D0 = w0_now.shape[2], w0_now.shape[1]
+                    opt0_input = torch.stack([w0_now, w0_grad], dim=-1).reshape(-1, 2)   # [b * L0 * D0, 2]
+                    w0_update = opts[0](opt0_input) # [b * L0 * D0, 2] -> [b * L0 * D0, 1]
+                    w0_update = w0_update.reshape(w0_now.shape[0], D0, L0) # [b * L0 * D0, 1] -> [b, D0, L0]
+
+                    L2, D2 = w2_now.shape[2], w2_now.shape[1]
+                    opt2_input = torch.stack([w2_now, w2_grad], dim=-1).reshape(-1, 2)   # [b * L2 * D2, 2]
+                    w2_update = opts[2](opt2_input) # [b * L2 * D2, 2] -> [b * L2 * D2, 1]
+                    w2_update = w2_update.reshape(w2_now.shape[0], D2, L2) # [b * L2 * D2, 1] -> [b, D2, L2]
+
+            if residual:
+                w1_now = w1_now + w1_update
+                w0_now = w0_now + w0_update
+                w2_now = w2_now + w2_update
+            else:
+                w1_now = w1_update
+                w0_now = w0_update
+                w2_now = w2_update
+
+            if normalize_weight:
+                # do weight norm here
+                w0_now = w0_now / (w0_now.norm(dim=1, keepdim=True) + 1e-5) * w0_norm
+                w1_now = w1_now / (w1_now.norm(dim=1, keepdim=True) + 1e-5) * w1_norm
+                w2_now = w2_now / (w2_now.norm(dim=1, keepdim=True) + 1e-5) * w2_norm
 
             w0, w1, w2 = w0_now, w1_now, w2_now
 
@@ -196,6 +234,28 @@ def fast_weight_swish_glu_weight_norm_mini_batch_apply(
             # Only calculate the output in the last repeat.
             qi = q[:, start:end, :]
             oi = (F.silu(qi @ w0_now, inplace=True) * (qi @ w2_now)) @ w1_now
+            # pull oi to the domain of vi
+            if output_norm_method == "mean_std":
+                oi = (oi - oi.mean(dim=1, keepdim=True)) / (oi.std(dim=1, keepdim=True) + 1e-5)
+                oi = oi * vi.std(dim=1, keepdim=True) + vi.mean(dim=1, keepdim=True)
+            elif output_norm_method == "affine":
+                raise NotImplementedError("Affine output normalization is not implemented yet")
+                # v_mean = vi.mean(dim=1, keepdim=True)
+                # v_cent = vi - v_mean
+                # o_cent = oi - v_mean
+                
+                # # affine projection
+                # # compute in float32 for stability
+                # v_cent_f = v_cent.float()
+                # o_cent_f = o_cent.float()
+                # # P = V+ @ V (project onto row space of V)
+                # P = torch.linalg.pinv(v_cent_f) @ v_cent_f
+                # oi = (o_cent_f @ P).to(oi.dtype) + v_mean
+            elif output_norm_method == "none":
+                pass
+            else:
+                 raise ValueError(f"Unknown output_norm_method: {output_norm_method}")
+
             output.append(oi)
 
     output = torch.cat(output, dim=1)
@@ -228,8 +288,13 @@ class FastWeightGluMLPMultihead(nn.Module):
         base_lr=0.01,
         muon_update_steps=0,
         use_learnable_opt: bool = False,
+        opt_type: str = "",
         n_blocks_per_opt: int = 2,
+        opt_hidden_dim: int = 256,
         shared_opts: nn.ModuleList = None,
+        residual: bool = True,
+        normalize_weight: bool = True,
+        output_norm_method: str = "none",
     ):
         super().__init__()
         self.dim = dim
@@ -262,6 +327,11 @@ class FastWeightGluMLPMultihead(nn.Module):
 
         # learnable opt.
         self.use_learnable_opt = use_learnable_opt
+        self.opt_type = opt_type
+        self.residual = residual
+        self.normalize_weight = normalize_weight
+        self.output_norm_method = output_norm_method
+        self.opt_hidden_dim = opt_hidden_dim
         self.n_blocks_per_opt = n_blocks_per_opt
         if use_learnable_opt:
             if shared_opts is not None:
@@ -305,7 +375,11 @@ class FastWeightGluMLPMultihead(nn.Module):
             w0, w1, w2, q, k, v, lr0, lr1, lr2, info["ttt_op_order"],
             muon_update_steps=self.muon_update_steps,
             use_learnable_opt=self.use_learnable_opt,
+            opt_type=self.opt_type,
             opts=self.opts if self.use_learnable_opt else None,
+            residual=self.residual,
+            normalize_weight=self.normalize_weight,
+            output_norm_method=self.output_norm_method,
         )
 
         output = self.o_norm(output)
