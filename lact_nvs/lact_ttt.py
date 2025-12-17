@@ -30,7 +30,9 @@ def silu_backprop(dy: torch.Tensor, x: torch.Tensor):
 
 # @torch.compile
 def fast_weight_swish_glu_fwd(q: torch.Tensor, w0: torch.Tensor, w1: torch.Tensor, w2: torch.Tensor):
-    return F.silu(q @ w0, inplace=True) * (q @ w2) @ w1
+    # inplace operations will cause memory-hungry when combined with create_graph=True
+    # return F.silu(q @ w0, inplace=True) * (q @ w2) @ w1
+    return F.silu(q @ w0, inplace=False) * (q @ w2) @ w1
 
 
 @torch.compile
@@ -129,18 +131,17 @@ def fast_weight_swish_glu_weight_norm_mini_batch_apply(
             # make sure compute graph tracking is enabled.
             with torch.enable_grad():
                 # make a copy of the weights
-                # w1_now_ = w1_now.requires_grad_(True)
-                # w0_now_ = w0_now.requires_grad_(True)
-                # w2_now_ = w2_now.requires_grad_(True)
-                w1_now_ = w1_now.detach().requires_grad_(True)
-                w0_now_ = w0_now.detach().requires_grad_(True)
-                w2_now_ = w2_now.detach().requires_grad_(True)
+                w1_now_ = w1_now.requires_grad_(True)
+                w0_now_ = w0_now.requires_grad_(True)
+                w2_now_ = w2_now.requires_grad_(True)
                 vpi = fast_weight_swish_glu_fwd(ki, w0_now_, w1_now_, w2_now_)
                 loss = -vpi * vi
 
-                w1_grad = torch.autograd.grad((lr1i * loss).sum(), w1_now_, create_graph=True)[0]
-                w0_grad = torch.autograd.grad((lr0i * loss).sum(), w0_now_, create_graph=True)[0]
-                w2_grad = torch.autograd.grad((lr2i * loss).sum(), w2_now_, create_graph=True)[0]
+                w1_grad, w0_grad, w2_grad = torch.autograd.grad(
+                    [(lr1i * loss).sum(), (lr0i * loss).sum(), (lr2i * loss).sum()], 
+                    [w1_now_, w0_now_, w2_now_], 
+                    create_graph=True
+                )
 
             # orthogonalized gradients
             w1_grad = zeropower_via_newtonschulz5(w1_grad, muon_update_steps)
