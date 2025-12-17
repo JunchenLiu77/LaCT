@@ -9,12 +9,12 @@ from einops import rearrange
 
 TTTOperator = collections.namedtuple("TTTOperator", ["start", "end", "update", "apply"])
 
-
+@torch.compile
 def inv_softplus(x):
     y = x + math.log(-math.expm1(-x))
     return y
 
-
+@torch.compile
 def silu_backprop(dy: torch.Tensor, x: torch.Tensor):
     """
     Args:
@@ -27,6 +27,10 @@ def silu_backprop(dy: torch.Tensor, x: torch.Tensor):
     sigma = torch.sigmoid(x)
     dx = dy * sigma * (1 + x * (1 - sigma))
     return dx
+
+# @torch.compile
+def fast_weight_swish_glu_fwd(q: torch.Tensor, w0: torch.Tensor, w1: torch.Tensor, w2: torch.Tensor):
+    return F.silu(q @ w0, inplace=True) * (q @ w2) @ w1
 
 
 @torch.compile
@@ -67,7 +71,7 @@ def zeropower_via_newtonschulz5(G, steps):
     return X
 
 
-
+# @torch.compile
 def fast_weight_swish_glu_weight_norm_mini_batch_apply(
     w0: torch.Tensor,
     w1: torch.Tensor,
@@ -107,27 +111,50 @@ def fast_weight_swish_glu_weight_norm_mini_batch_apply(
             lr1i = lr1[:, start:end, :]  # [b, l, d/1] fp32
             lr2i = lr2[:, start:end, :]  # [b, l, d/1] fp32
 
-            gate_before_act = ki @ w0_now       # b[b, l, dh] = [b, l, d] @ [b, d, dh]
-            hidden_before_mul = ki @ w2_now     # b[b, l, dh] = [b, l, d] @ [b, d, dh]
-            hidden = F.silu(gate_before_act, inplace=False) * hidden_before_mul
+            # manually compute the gradient
+            # gate_before_act = ki @ w0_now       # b[b, l, dh] = [b, l, d] @ [b, d, dh]
+            # hidden_before_mul = ki @ w2_now     # b[b, l, dh] = [b, l, d] @ [b, d, dh]
+            # hidden = F.silu(gate_before_act, inplace=False) * hidden_before_mul
 
-            dhidden = vi @ w1_now.transpose(-1, -2)  # [b, l, dh] = [b, l, d] @ [b, d, dh]
-            dhidden_before_mul = dhidden * F.silu(gate_before_act, inplace=False)
-            dgate = dhidden * hidden_before_mul
-            dgate_before_act = silu_backprop(dgate, gate_before_act)
+            # dhidden = -vi @ w1_now.transpose(-1, -2)  # [b, l, dh] = [b, l, d] @ [b, d, dh]
+            # dhidden_before_mul = dhidden * F.silu(gate_before_act, inplace=False)
+            # dgate = dhidden * hidden_before_mul
+            # dgate_before_act = silu_backprop(dgate, gate_before_act)
 
-            w1_grad = zeropower_via_newtonschulz5(
-                (hidden * lr1i).transpose(-1, -2) @ vi, muon_update_steps
-            )
-            w0_grad = zeropower_via_newtonschulz5(
-                (ki * lr0i).transpose(-1, -2) @ dgate_before_act, muon_update_steps
-            )
-            w2_grad = zeropower_via_newtonschulz5(
-                (ki * lr2i).transpose(-1, -2) @ dhidden_before_mul, muon_update_steps
-            )
-            w1_now = w1_now + w1_grad
-            w0_now = w0_now + w0_grad
-            w2_now = w2_now + w2_grad
+            # w1_grad = ((hidden * lr1i).transpose(-1, -2) @ -vi)
+            # w0_grad = ((ki * lr0i).transpose(-1, -2) @ dgate_before_act)
+            # w2_grad = ((ki * lr2i).transpose(-1, -2) @ dhidden_before_mul)
+
+            # use auto-grad to compute the gradient
+            # make sure compute graph tracking is enabled.
+            with torch.enable_grad():
+                # make a copy of the weights
+                # w1_now_ = w1_now.requires_grad_(True)
+                # w0_now_ = w0_now.requires_grad_(True)
+                # w2_now_ = w2_now.requires_grad_(True)
+                w1_now_ = w1_now.detach().requires_grad_(True)
+                w0_now_ = w0_now.detach().requires_grad_(True)
+                w2_now_ = w2_now.detach().requires_grad_(True)
+                vpi = fast_weight_swish_glu_fwd(ki, w0_now_, w1_now_, w2_now_)
+                loss = -vpi * vi
+
+                w1_grad = torch.autograd.grad((lr1i * loss).sum(), w1_now, create_graph=True)[0]
+                w0_grad = torch.autograd.grad((lr0i * loss).sum(), w0_now, create_graph=True)[0]
+                w2_grad = torch.autograd.grad((lr2i * loss).sum(), w2_now, create_graph=True)[0]
+
+            # orthogonalized gradients
+            w1_grad = zeropower_via_newtonschulz5(w1_grad, muon_update_steps)
+            w0_grad = zeropower_via_newtonschulz5(w0_grad, muon_update_steps)
+            w2_grad = zeropower_via_newtonschulz5(w2_grad, muon_update_steps)
+
+
+            w1_now = w1_now - w1_grad
+            w0_now = w0_now - w0_grad
+            w2_now = w2_now - w2_grad
+
+            # w1_now = w1_now + w1_grad
+            # w0_now = w0_now + w0_grad
+            # w2_now = w2_now + w2_grad
 
             # do weight norm here
             w0_now = w0_now / (w0_now.norm(dim=1, keepdim=True) + 1e-5) * w0_norm
@@ -139,7 +166,7 @@ def fast_weight_swish_glu_weight_norm_mini_batch_apply(
         if apply:
             # Only calculate the output in the last repeat.
             qi = q[:, start:end, :]
-            oi = (F.silu(qi @ w0_now, inplace=True) * (qi @ w2_now)) @ w1_now
+            oi = fast_weight_swish_glu_fwd(qi, w0_now, w1_now, w2_now)
             output.append(oi)
 
     output = torch.cat(output, dim=1)

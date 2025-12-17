@@ -47,3 +47,13 @@ build/
 dist/
 *.egg-info/
 .eggs/
+
+**/data_example/dl3dv_*
+weight/
+output/
+
+# wandb
+wandb/
+
+# uv
+uv.lock

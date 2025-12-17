@@ -92,14 +92,23 @@ class NVSDataset(Dataset):
         data_path, num_views, image_size, 
         sorted_indices=False, 
         scene_pose_normalize=False,
+        fixed_indices=None,
     ):
         """
         image_size is (h, w) or just a int (as size).
+        fixed_indices: optional dict {scene_name: [indices...]} to override selection logic.
         """
         self.base_dir = os.path.dirname(data_path)
         self.data_point_paths = json.load(open(data_path, "r"))
         self.sorted_indices = sorted_indices
         self.scene_pose_normalize = scene_pose_normalize
+        self.fixed_indices = fixed_indices
+
+        # filter out the scenes that have less than num_views images
+        original_num_scenes = len(self.data_point_paths)
+        self.data_point_paths = [path for path in self.data_point_paths if len(json.load(open(os.path.join(self.base_dir, path), "r"))) >= num_views]
+        filtered_num_scenes = len(self.data_point_paths)
+        print(f"Found {original_num_scenes} scenes in the index file, filtered out {original_num_scenes - filtered_num_scenes} scenes with less than {num_views} images, remaining {filtered_num_scenes} scenes")
 
         self.num_views = num_views
         if isinstance(image_size, int):
@@ -113,13 +122,24 @@ class NVSDataset(Dataset):
     def __getitem__(self, index):
         data_point_path = os.path.join(self.base_dir, self.data_point_paths[index])
         data_point_base_dir = os.path.dirname(data_point_path)
+        scene_name = os.path.basename(data_point_base_dir)
+
         with open(data_point_path, "r") as f:
             images_info = json.load(f)
         
-        # If the num_views is larger than the number of images, use all images
-        indices = random.sample(range(len(images_info)), min(self.num_views, len(images_info)))
-        if self.sorted_indices:
-            indices = sorted(indices)
+        # Determine indices
+        if self.fixed_indices is not None and scene_name in self.fixed_indices:
+            # Use fixed indices provided externally
+            indices = self.fixed_indices[scene_name]
+            # If fixed_indices are used, we assume they are pre-ordered as desired (e.g. interleaved).
+            # We do NOT sort them unless sorted_indices is explicitly True, but typically we turn it off.
+            if self.sorted_indices:
+                 indices = sorted(indices)
+        else:
+            # If the num_views is larger than the number of images, use all images
+            indices = random.sample(range(len(images_info)), min(self.num_views, len(images_info)))
+            if self.sorted_indices:
+                indices = sorted(indices)
         
         fxfycxcy_list = []
         c2w_list = []
@@ -155,11 +175,13 @@ class NVSDataset(Dataset):
         
         c2ws = torch.stack(c2w_list)
         if self.scene_pose_normalize:
-            print("Normalizing scene poses...")
+            # print("Normalizing scene poses...")
             c2ws = normalize_with_mean_pose(c2ws)
 
         return {
             "fxfycxcy": torch.tensor(fxfycxcy_list),
             "c2w": c2ws,
             "image": torch.stack(image_list),
+            "indices": torch.tensor(indices),
+            "scene_name": scene_name,
         }
