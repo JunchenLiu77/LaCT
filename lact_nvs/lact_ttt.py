@@ -138,9 +138,9 @@ def fast_weight_swish_glu_weight_norm_mini_batch_apply(
                 vpi = fast_weight_swish_glu_fwd(ki, w0_now_, w1_now_, w2_now_)
                 loss = -vpi * vi
 
-                w1_grad = torch.autograd.grad((lr1i * loss).sum(), w1_now, create_graph=True)[0]
-                w0_grad = torch.autograd.grad((lr0i * loss).sum(), w0_now, create_graph=True)[0]
-                w2_grad = torch.autograd.grad((lr2i * loss).sum(), w2_now, create_graph=True)[0]
+                w1_grad = torch.autograd.grad((lr1i * loss).sum(), w1_now_, create_graph=True)[0]
+                w0_grad = torch.autograd.grad((lr0i * loss).sum(), w0_now_, create_graph=True)[0]
+                w2_grad = torch.autograd.grad((lr2i * loss).sum(), w2_now_, create_graph=True)[0]
 
             # orthogonalized gradients
             w1_grad = zeropower_via_newtonschulz5(w1_grad, muon_update_steps)
