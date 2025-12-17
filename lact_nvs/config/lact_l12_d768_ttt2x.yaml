@@ -20,7 +20,7 @@ block_config:
       opt_type: "dit"
       n_blocks_per_opt: 1
       opt_hidden_dim: 256
-      residual: true
+      residual: "add"
       normalize_weight: true
       output_norm_method: "none"
   - type: model.MLP

@@ -38,6 +38,7 @@ def main():
     parser.add_argument("--compile", action="store_true")
     parser.add_argument("--actckpt", action="store_true")
     parser.add_argument("--bs_per_gpu", type=int, default=8)
+    
     parser.add_argument("--num_all_views", type=int, default=15)
     parser.add_argument("--num_input_views", type=int, default=8)
     parser.add_argument("--num_target_views", type=int, default=8)  
@@ -47,7 +48,7 @@ def main():
     # Inference
     parser.add_argument("--test_every", type=int, default=-1, help="Test every N iterations")
     parser.add_argument("--first_n", type=int, default=None)
-    parser.add_argument("--test_batch_size", type=int, default=1)
+    parser.add_argument("--test_bs_per_gpu", type=int, default=1)
     parser.add_argument("--scene_inference", action="store_true")
 
     # Optimizer
@@ -62,8 +63,7 @@ def main():
     # Model
     parser.add_argument("--use_learnable_opt", action="store_true")
     parser.add_argument("--opt_type", type=str, default="", help="Type of optimizer")
-    parser.add_argument("--residual", action="store_true")
-    parser.add_argument("--no_residual", action="store_true")
+    parser.add_argument("--residual", type=str, default="add", choices=["none", "add", "minus"])
     parser.add_argument("--normalize_weight", action="store_true")
     parser.add_argument("--no_normalize_weight", action="store_true")
     parser.add_argument("--opt_hidden_dim", type=int, default=256)
@@ -85,11 +85,7 @@ def main():
     if hasattr(args, "opt_type") and args.opt_type:
         model_config.block_config[1]["params"]["opt_type"] = args.opt_type
     if hasattr(args, "residual") and args.residual:
-        assert not (hasattr(args, "no_residual") and args.no_residual), "residual and no-residual cannot be set at the same time"
         model_config.block_config[1]["params"]["residual"] = args.residual
-    if hasattr(args, "no_residual") and args.no_residual:
-        assert not (hasattr(args, "residual") and args.residual), "residual and no-residual cannot be set at the same time"
-        model_config.block_config[1]["params"]["residual"] = False
     if hasattr(args, "normalize_weight") and args.normalize_weight:
         assert not (hasattr(args, "no_normalize_weight") and args.no_normalize_weight), "normalize_weight and no-normalize_weight cannot be set at the same time"
         model_config.block_config[1]["params"]["normalize_weight"] = args.normalize_weight
@@ -287,7 +283,7 @@ def main():
         test_dataloader_seed_generator.manual_seed(rank_specific_seed)
         test_loader = DataLoader(
             test_set,
-            batch_size=args.bs_per_gpu,
+            batch_size=args.test_bs_per_gpu,
             shuffle=False,
             num_workers=4,
             persistent_workers=True,
@@ -514,6 +510,8 @@ def main():
                         "test/psnr": avg_psnr,
                         "test/lpips": avg_lpips,
                     }, step=now_iters)
+            
+            exit()
             data_dict = {key: value.cuda() for key, value in data_dict.items() if isinstance(value, torch.Tensor)}
             input_data_dict = {key: value[:, :args.num_input_views] for key, value in data_dict.items()}
             target_data_dict = {key: value[:, -args.num_target_views:] for key, value in data_dict.items()}

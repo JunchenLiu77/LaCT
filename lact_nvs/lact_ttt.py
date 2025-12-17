@@ -83,9 +83,10 @@ def fast_weight_swish_glu_weight_norm_mini_batch_apply(
     use_learnable_opt: bool = False,
     opt_type: str = "",
     opts: nn.ModuleList = None,
-    residual: bool = True,
+    residual: str = "none",
     normalize_weight: bool = True,
     output_norm_method: str = "none",
+    block_idx: int = None,
 ):
     """
     Note:
@@ -101,9 +102,10 @@ def fast_weight_swish_glu_weight_norm_mini_batch_apply(
     use_learnable_opt: if True, the opts will be used to update the weights.
     opt_type: "dit" or "mlp". If "dit", use the dit optimizer to update the weights. If "mlp", use a simple MLP to update the weights.
     opts: if use_learnable_opt is True, this should contains three learnable optimizers to update w0, w1, w2.
-    residual: if True, use the residual update for the weights.
+    residual: "none", "add" or "minus". If "add", add the update to the weights. If "minus", subtract the update from the weights.
     normalize_weight: if True, normalize the weights after updating.
     output_norm_method: "none", "mean_std" or "affine". Method to normalize the output.
+    block_idx: the index of the block.
     """
     if use_learnable_opt:
         assert opt_type in ["dit", "mlp"], f"opt_type should be 'dit' or 'mlp', but got {opt_type}"
@@ -213,11 +215,15 @@ def fast_weight_swish_glu_weight_norm_mini_batch_apply(
                     w2_update = opts[2](opt2_input) # [b * L2 * D2, 2] -> [b * L2 * D2, 1]
                     w2_update = w2_update.reshape(w2_now.shape[0], D2, L2) # [b * L2 * D2, 1] -> [b, D2, L2]
 
-            if residual:
+            if residual == "add":
                 w1_now = w1_now + w1_update
                 w0_now = w0_now + w0_update
                 w2_now = w2_now + w2_update
-            else:
+            elif residual == "minus":
+                w1_now = w1_now - w1_update
+                w0_now = w0_now - w0_update
+                w2_now = w2_now - w2_update
+            elif residual == "none":
                 w1_now = w1_update
                 w0_now = w0_update
                 w2_now = w2_update
@@ -234,6 +240,30 @@ def fast_weight_swish_glu_weight_norm_mini_batch_apply(
             # Only calculate the output in the last repeat.
             qi = q[:, start:end, :]
             oi = (F.silu(qi @ w0_now, inplace=True) * (qi @ w2_now)) @ w1_now
+
+            # show the statistics of v' and v, also the distance vector
+            # vpi = (F.silu(ki @ w0_now, inplace=True) * (ki @ w2_now)) @ w1_now
+            # print(f"[{start}:{end}] q mean: {qi.mean().item()}, q std: {qi.std().item()}")
+            # print(f"[{start}:{end}] k mean: {ki.mean().item()}, k std: {ki.std().item()}")
+            # print(f"[{start}:{end}] o mean: {oi.mean().item()}, o std: {oi.std().item()}")
+            # print(f"[{start}:{end}] vp mean: {vpi.mean().item()}, vp std: {vpi.std().item()}")
+            # print(f"[{start}:{end}] v mean: {vi.mean().item()}, v std: {vi.std().item()}")
+            # print(f"[{start}:{end}] L2_norm(vp - v) mean: {torch.linalg.norm(vpi - vi, dim=1).mean().item()}")
+            # print(f"[{start}:{end}] L2_norm(vp + v) mean: {torch.linalg.norm(vpi + vi, dim=1).mean().item()}")
+
+            # instead of printing the statistics, we save the tensors directly then visualize them later
+            if block_idx is not None:
+                vpi = (F.silu(ki @ w0_now, inplace=True) * (ki @ w2_now)) @ w1_now
+                import os
+                
+                os.makedirs(f"output/vis_feature/{residual}/{block_idx}", exist_ok=True)
+                torch.save(qi, f"output/vis_feature/{residual}/{block_idx}/q.pt")
+                torch.save(ki, f"output/vis_feature/{residual}/{block_idx}/k.pt")
+                torch.save(oi, f"output/vis_feature/{residual}/{block_idx}/o.pt")
+                torch.save(vi, f"output/vis_feature/{residual}/{block_idx}/v.pt")
+                torch.save(vpi, f"output/vis_feature/{residual}/{block_idx}/vp.pt")
+                print(f"Saved tensors to output/vis_feature/{residual}/{block_idx}")
+
             # pull oi to the domain of vi
             if output_norm_method == "mean_std":
                 oi = (oi - oi.mean(dim=1, keepdim=True)) / (oi.std(dim=1, keepdim=True) + 1e-5)
@@ -292,15 +322,18 @@ class FastWeightGluMLPMultihead(nn.Module):
         n_blocks_per_opt: int = 2,
         opt_hidden_dim: int = 256,
         shared_opts: nn.ModuleList = None,
-        residual: bool = True,
+        residual: str = "none",
         normalize_weight: bool = True,
         output_norm_method: str = "none",
+        block_idx: int = None,
     ):
         super().__init__()
         self.dim = dim
+        assert residual in ["none", "add", "minus"], f"residual should be 'none', 'add' or 'minus', but got {residual}"
         assert dim % head_dim == 0
         self.num_heads = dim // head_dim
         self.muon_update_steps = muon_update_steps
+        self.block_idx = block_idx
 
         d_in = d_out = head_dim
         d_h = int(head_dim * inter_multi)
@@ -380,6 +413,7 @@ class FastWeightGluMLPMultihead(nn.Module):
             residual=self.residual,
             normalize_weight=self.normalize_weight,
             output_norm_method=self.output_norm_method,
+            block_idx=self.block_idx,
         )
 
         output = self.o_norm(output)

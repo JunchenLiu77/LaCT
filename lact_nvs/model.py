@@ -92,7 +92,7 @@ class MLP(nn.Module):
 
 
 class Block(nn.Module):
-    def __init__(self, dim, bias, block_config, shared_opts=None):
+    def __init__(self, dim, bias, block_config, shared_opts=None, block_idx=None):
         super().__init__()
         module_list = []
         self.length_dim_list = []
@@ -103,7 +103,7 @@ class Block(nn.Module):
             module = nn.ModuleDict(
                 {
                     "ln": LayerNorm(dim, bias=bias),
-                    "f": CLASS(dim=dim, bias=bias, **module_config["params"]) if module_name != "lact_ttt.FastWeightGluMLPMultihead" else CLASS(dim=dim, bias=bias, **module_config["params"], shared_opts=shared_opts),
+                    "f": CLASS(dim=dim, bias=bias, **module_config["params"]) if module_name != "lact_ttt.FastWeightGluMLPMultihead" else CLASS(dim=dim, bias=bias, **module_config["params"], shared_opts=shared_opts, block_idx=block_idx),
                 }
             )
 
@@ -219,8 +219,8 @@ class LaCTLVSM(nn.Module):
             
         self.blocks = nn.ModuleList([
             Block(
-                dim=self.dim, bias=False, block_config=block_config, shared_opts=opts)
-            for _ in range(layers)
+                dim=self.dim, bias=False, block_config=block_config, shared_opts=opts, block_idx=block_idx)
+            for block_idx in range(layers)
         ])
 
         self.image_token_decoder = nn.Sequential(

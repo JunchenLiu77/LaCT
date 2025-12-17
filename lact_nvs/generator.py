@@ -126,6 +126,8 @@ class Generator:
                 base += f" --lpips_start {args.lpips_start}"
             if args.test_every is not None:
                 base += f" --test_every {args.test_every}"
+            if args.test_bs_per_gpu is not None:
+                base += f" --test_bs_per_gpu {args.test_bs_per_gpu}"
             if args.scene_inference:
                 base += " --scene_inference"
             if args.first_n is not None:
@@ -140,10 +142,8 @@ class Generator:
                 base += " --use_shared_opts"
             if args.opt_type is not None:
                 base += f" --opt_type {args.opt_type}"
-            if args.residual:
-                base += " --residual"
-            if args.no_residual:
-                base += " --no_residual"
+            if args.residual is not None:
+                base += f" --residual {args.residual}"
             if args.normalize_weight:
                 base += " --normalize_weight"
             if args.no_normalize_weight:
@@ -270,7 +270,7 @@ def main():
                         help='Use scene inference mode')
     parser.add_argument('--first-n', type=int,
                         help='First N samples to process')
-    parser.add_argument('--test-batch-size', type=int,
+    parser.add_argument('--test-bs-per-gpu', type=int,
                         help='Test batch size')
     
     # Training-only arguments
@@ -310,10 +310,10 @@ def main():
                         help='Use shared optimizer')
     parser.add_argument('--opt-type', type=str,
                         help='Type of optimizer')
-    parser.add_argument('--residual', action='store_true',
-                        help='Use residual update')
-    parser.add_argument('--no-residual', action='store_true',
-                        help='Do not use residual update')
+    parser.add_argument('--residual', type=str,
+                        choices=['none', 'add', 'minus'],
+                        default='add',
+                        help='Residual update method')
     parser.add_argument('--normalize-weight', action='store_true',
                         help='Normalize weight')
     parser.add_argument('--no-normalize-weight', action='store_true',
