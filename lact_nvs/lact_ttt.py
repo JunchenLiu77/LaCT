@@ -86,6 +86,7 @@ def fast_weight_swish_glu_weight_norm_mini_batch_apply(
     lr2: torch.Tensor,
     ttt_ua_order: list,
     muon_update_steps: int = 0,
+    ttt_loss_type: str = "dot_product",
 ):
     """
     Note:
@@ -135,7 +136,26 @@ def fast_weight_swish_glu_weight_norm_mini_batch_apply(
                 w0_now_ = w0_now.requires_grad_(True)
                 w2_now_ = w2_now.requires_grad_(True)
                 vpi = fast_weight_swish_glu_fwd(ki, w0_now_, w1_now_, w2_now_)
-                loss = -vpi * vi
+                
+                if ttt_loss_type == "dot_product":
+                    loss = -vpi * vi
+                elif ttt_loss_type == "mse":
+                    loss = (vpi - vi)**2
+                elif ttt_loss_type == "rmse":
+                    loss = torch.sqrt((vpi - vi)**2 + 1e-8)
+                elif ttt_loss_type == "mae":
+                    loss = torch.abs(vpi - vi)
+                # some weird loss functions, doesn't have to be regression loss
+                elif ttt_loss_type == "inv_dot_product":
+                    loss = vpi * vi
+                elif ttt_loss_type == "inv_mse":
+                    loss = -(vpi - vi)**2
+                elif ttt_loss_type == "inv_rmse":
+                    loss = -torch.sqrt((vpi - vi)**2 + 1e-8)
+                elif ttt_loss_type == "inv_mae":
+                    loss = -torch.abs(vpi - vi)
+                else:
+                    raise ValueError(f"Unknown ttt_loss_type: {ttt_loss_type}")
 
                 w1_grad, w0_grad, w2_grad = torch.autograd.grad(
                     [(lr1i * loss).sum(), (lr0i * loss).sum(), (lr2i * loss).sum()], 
@@ -199,12 +219,15 @@ class FastWeightGluMLPMultihead(nn.Module):
         bias: bool = False,
         base_lr=0.01,
         muon_update_steps=0,
+        ttt_loss_type="dot_product",
     ):
         super().__init__()
         self.dim = dim
         assert dim % head_dim == 0
         self.num_heads = dim // head_dim
         self.muon_update_steps = muon_update_steps
+        self.ttt_loss_type = ttt_loss_type
+        print(f"TTT loss type: {ttt_loss_type}")
 
         d_in = d_out = head_dim
         d_h = int(head_dim * inter_multi)
@@ -263,6 +286,7 @@ class FastWeightGluMLPMultihead(nn.Module):
         output, w0, w1, w2 = fast_weight_swish_glu_weight_norm_mini_batch_apply(
             w0, w1, w2, q, k, v, lr0, lr1, lr2, info["ttt_op_order"],
             muon_update_steps=self.muon_update_steps,
+            ttt_loss_type=self.ttt_loss_type,
         )
 
         output = self.o_norm(output)
@@ -276,6 +300,7 @@ class FastWeightGluMLPMultihead(nn.Module):
     def extra_repr(self) -> str:
         return (f"w0 shape: {self.w0.shape}, w1 shape: {self.w1.shape}, w2 shape: {self.w2.shape}, "
                 f"Muon update steps: {self.muon_update_steps}, "
-                f"Base lr: {math.log(1 + math.exp(self.base_lr_inv))}, ")
+                f"Base lr: {math.log(1 + math.exp(self.base_lr_inv))}, "
+                f"TTT loss type: {self.ttt_loss_type}, ")
 
 

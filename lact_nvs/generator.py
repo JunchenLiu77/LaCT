@@ -132,6 +132,8 @@ class Generator:
                 base += f" --first_n {args.first_n}"
             if args.grad_clip is not None:
                 base += f" --grad_clip {args.grad_clip}"
+            if args.ttt_loss_type is not None:
+                base += f" --ttt_loss_type {args.ttt_loss_type}"
             run_cmd = f"srun --time {args.time or self.slurm_defaults['time']} uv run {base}"
 
         # Generate the script content
@@ -290,6 +292,10 @@ def main():
                         help='GPU type')
     parser.add_argument('--memory', type=str,
                         help='Memory allocation (e.g., 48GB)')
+
+    # Model config
+    parser.add_argument('--ttt-loss-type', type=str,
+                        help='TTT loss type: dot_product, mse, rmse, mae, cosine, inv_dot_product, inv_mse, inv_rmse, inv_mae, inv_cosine')
     
     # Other options
     parser.add_argument('--dry-run', action='store_true',

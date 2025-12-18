@@ -60,9 +60,15 @@ def main():
     parser.add_argument("--grad_clip", type=float, default=1.0, help="Gradient clipping value")
 
     # Model config
+    parser.add_argument("--ttt_loss_type", type=str, default=None, help="TTT loss type: dot_product, mse, rmse, mae, smooth_l1")
 
     args = parser.parse_args()
     model_config = omegaconf.OmegaConf.load(args.config)
+
+    if args.ttt_loss_type is not None:
+        for block in model_config.block_config:
+            if block.type == "lact_ttt.FastWeightGluMLPMultihead":
+                block.params.ttt_loss_type = args.ttt_loss_type
     
     output_dir = f"output/{args.expname}"
     os.makedirs(output_dir, exist_ok=True)
@@ -271,6 +277,7 @@ def main():
                 "scene_pose_normalize": args.scene_pose_normalize,
                 "compile": args.compile,
                 "actckpt": args.actckpt,
+                "ttt_loss_type": args.ttt_loss_type,
             },
             resume="allow",
         )

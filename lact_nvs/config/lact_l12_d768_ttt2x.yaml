@@ -15,6 +15,7 @@ block_config:
       inter_multi: 2
       base_lr: 0.01
       muon_update_steps: 5
+      ttt_loss_type: dot_product
   - type: model.MLP
     length_dim: vl
     params:
