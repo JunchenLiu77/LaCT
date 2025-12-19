@@ -154,6 +154,23 @@ def fast_weight_swish_glu_weight_norm_mini_batch_apply(
                     loss = -torch.sqrt((vpi - vi)**2 + 1e-8)
                 elif ttt_loss_type == "inv_mae":
                     loss = -torch.abs(vpi - vi)
+                # even more arbitrary functions
+                elif ttt_loss_type == "vp**2+v":
+                    loss = vpi**2 + vi
+                elif ttt_loss_type == "vp*v**2":
+                    loss = vpi * vi**2
+                elif ttt_loss_type == "sin(vp*v)":
+                    loss = torch.sin(vpi * vi)
+                elif ttt_loss_type == "-(vp**2+v**0.5)**2":
+                    loss = -((vpi**2 + vi**0.5)**2)
+                elif ttt_loss_type == "exp(vp*v)":
+                    loss = torch.exp(vpi * vi)
+                # non-binary functions
+                elif ttt_loss_type == "vp**2":
+                    loss = vpi**2
+                    print(f"using vp**2 loss")
+                elif ttt_loss_type == "v**2":
+                    loss = vi**2
                 else:
                     raise ValueError(f"Unknown ttt_loss_type: {ttt_loss_type}")
 

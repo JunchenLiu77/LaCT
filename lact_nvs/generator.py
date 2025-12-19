@@ -21,6 +21,7 @@ Examples:
 
 import argparse
 import os
+import subprocess
 from datetime import datetime
 
 class Generator:
@@ -67,7 +68,7 @@ class Generator:
             if args.data_path:
                 cmd += f" --data_path {args.data_path}"
             if args.expname:
-                cmd += f" --expname {args.expname}"
+                cmd += f" --expname '{args.expname}'"
             if args.num_all_views is not None:
                 cmd += f" --num_all_views {args.num_all_views}"
             if args.num_input_views is not None:
@@ -87,11 +88,11 @@ class Generator:
             base = f"torchrun --nproc_per_node={gpus} --standalone train.py --config {config_file}"
             # Add remaining training CLI options
             if args.expname:
-                base += f" --expname {args.expname}"
+                base += f" --expname='{args.expname}'"
             if args.data_path:
-                base += f" --data_path {args.data_path}"
+                base += f" --data_path='{args.data_path}'"
             if args.load:
-                base += f" --load {args.load}"
+                base += f" --load='{args.load}'"
             if args.save_every is not None:
                 base += f" --save_every {args.save_every}"
             if args.log_every is not None:
@@ -133,7 +134,7 @@ class Generator:
             if args.grad_clip is not None:
                 base += f" --grad_clip {args.grad_clip}"
             if args.ttt_loss_type is not None:
-                base += f" --ttt_loss_type {args.ttt_loss_type}"
+                base += f" --ttt_loss_type='{args.ttt_loss_type}'"
             run_cmd = f"srun --time {args.time or self.slurm_defaults['time']} uv run {base}"
 
         # Generate the script content
@@ -191,8 +192,6 @@ class Generator:
             "",
             "echo",
             f"echo \"Starting {'inference' if args.inference else 'training'}...\"",
-            "echo \"Command line:\"",
-            f"echo '{run_cmd}'",
             "echo",
             "",
             "# Run the job",
@@ -318,7 +317,7 @@ def main():
             pass
     if args.submit and not args.dry_run:
         print(f"Submitting job...")
-        os.system(f"sbatch {script_path}")
+        subprocess.run(["sbatch", script_path])
     else:
         if not args.dry_run:
             print(f"To submit: sbatch {script_path}")

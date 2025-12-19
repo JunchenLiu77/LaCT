@@ -60,7 +60,7 @@ def main():
     parser.add_argument("--grad_clip", type=float, default=1.0, help="Gradient clipping value")
 
     # Model config
-    parser.add_argument("--ttt_loss_type", type=str, default=None, help="TTT loss type: dot_product, mse, rmse, mae, smooth_l1")
+    parser.add_argument("--ttt_loss_type", type=str, default=None, help="TTT loss type: dot_product, mse, rmse, mae, etc.")
 
     args = parser.parse_args()
     model_config = omegaconf.OmegaConf.load(args.config)
