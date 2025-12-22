@@ -230,7 +230,7 @@ def main():
         return new_state_dict
 
     # Data
-    train_set = NVSDataset(args.data_path, args.num_all_views, tuple(args.image_size), scene_pose_normalize=args.scene_pose_normalize)
+    train_set = NVSDataset("data_example/dl3dv_10k_sample_data_path.json", args.num_all_views, tuple(args.image_size), scene_pose_normalize=args.scene_pose_normalize)
     train_sampler = DistributedSampler(train_set)
     train_loader = DataLoader(
         train_set,
@@ -271,7 +271,7 @@ def main():
         num_views_for_dataset = args.num_input_views + args.num_target_views
 
         test_set = NVSDataset(
-            args.data_path, 
+            "data_example/dl3dv_benchmark_sample_data_path.json", 
             num_views_for_dataset, 
             tuple(args.image_size), 
             sorted_indices=False,  # Important: false to preserve Input/Target block ordering

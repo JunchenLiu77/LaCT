@@ -92,8 +92,11 @@ def visualize_group(base_path, block_idx, tensor_names, group_name, method='tsne
         normalize: 'zscore', 'l2', 'per_tensor', or 'none'
         save_dir: Directory to save plots
     """
-    residuals = ['add', 'minus']
-    
+    os.makedirs(save_dir, exist_ok=True)
+
+    # residuals = ['add', 'minus']
+    residuals = ['add']
+
     # Color palette - distinguishable colors for each tensor
     colors = {
         'q': '#E63946',   # Red
@@ -197,6 +200,8 @@ def visualize_all_blocks(base_path, method='tsne', normalize='per_tensor', save_
 
 def create_summary_figure(base_path, method='tsne', normalize='per_tensor', save_dir='output/vis_feature/plots'):
     """Create a summary figure with all blocks in a grid."""
+    os.makedirs(save_dir, exist_ok=True)
+    
     add_path = os.path.join(base_path, 'add')
     block_indices = sorted([int(d) for d in os.listdir(add_path) if os.path.isdir(os.path.join(add_path, d))])
     
@@ -204,17 +209,19 @@ def create_summary_figure(base_path, method='tsne', normalize='per_tensor', save
     n_cols = 4
     n_rows = (n_blocks + n_cols - 1) // n_cols
     
-    residuals = ['add', 'minus']
+    # residuals = ['add', 'minus']
+    residuals = ['add']
     
     # Colors and markers
     colors = {
         'q': '#E63946', 'k': '#457B9D',
         'o': '#2A9D8F', 'v': '#E9C46A', 'vp': '#9B5DE5',
     }
-    markers = {'add': 'o', 'minus': 'x'}
+    # markers = {'add': 'o', 'minus': 'x'}
+    markers = {'add': 'o'}
     
-    # for group_name, tensor_names in [('qk', ['q', 'k']), ('ovvp', ['o', 'v', 'vp'])]:
-    for group_name, tensor_names in [('o', ['o']), ('v', ['v']), ('vp', ['vp'])]:
+    for group_name, tensor_names in [('qk', ['q', 'k']), ('ovvp', ['o', 'v', 'vp'])]:
+    # for group_name, tensor_names in [('o', ['o']), ('v', ['v']), ('vp', ['vp'])]:
         fig, axes = plt.subplots(n_rows, n_cols, figsize=(4 * n_cols, 4 * n_rows))
         axes = axes.flatten() if n_blocks > 1 else [axes]
         
