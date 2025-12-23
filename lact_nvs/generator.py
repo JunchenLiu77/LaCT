@@ -135,6 +135,8 @@ class Generator:
                 base += f" --grad_clip {args.grad_clip}"
             if args.ttt_loss_type is not None:
                 base += f" --ttt_loss_type='{args.ttt_loss_type}'"
+            if args.grad_calc_method is not None:
+                base += f" --grad_calc_method='{args.grad_calc_method}'"
             run_cmd = f"srun --time {args.time or self.slurm_defaults['time']} uv run {base}"
 
         # Generate the script content
@@ -295,7 +297,9 @@ def main():
     # Model config
     parser.add_argument('--ttt-loss-type', type=str,
                         help='TTT loss type: dot_product, mse, rmse, mae, cosine, inv_dot_product, inv_mse, inv_rmse, inv_mae, inv_cosine')
-    
+    parser.add_argument('--grad-calc-method', type=str,
+                        choices=['mannual', 'autograd'],
+                        help='Gradient calculation method: mannual, autograd')
     # Other options
     parser.add_argument('--dry-run', action='store_true',
                         help='Print script without saving')

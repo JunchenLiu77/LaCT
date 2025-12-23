@@ -87,6 +87,7 @@ def fast_weight_swish_glu_weight_norm_mini_batch_apply(
     ttt_ua_order: list,
     muon_update_steps: int = 0,
     ttt_loss_type: str = "dot_product",
+    grad_calc_method: str = "mannual",
 ):
     """
     Note:
@@ -114,85 +115,80 @@ def fast_weight_swish_glu_weight_norm_mini_batch_apply(
             lr1i = lr1[:, start:end, :]  # [b, l, d/1] fp32
             lr2i = lr2[:, start:end, :]  # [b, l, d/1] fp32
 
-            # manually compute the gradient
-            # gate_before_act = ki @ w0_now       # b[b, l, dh] = [b, l, d] @ [b, d, dh]
-            # hidden_before_mul = ki @ w2_now     # b[b, l, dh] = [b, l, d] @ [b, d, dh]
-            # hidden = F.silu(gate_before_act, inplace=False) * hidden_before_mul
+            if grad_calc_method == "mannual":
+                # manually compute the gradient
+                gate_before_act = ki @ w0_now       # b[b, l, dh] = [b, l, d] @ [b, d, dh]
+                hidden_before_mul = ki @ w2_now     # b[b, l, dh] = [b, l, d] @ [b, d, dh]
+                hidden = F.silu(gate_before_act, inplace=False) * hidden_before_mul
 
-            # dhidden = -vi @ w1_now.transpose(-1, -2)  # [b, l, dh] = [b, l, d] @ [b, d, dh]
-            # dhidden_before_mul = dhidden * F.silu(gate_before_act, inplace=False)
-            # dgate = dhidden * hidden_before_mul
-            # dgate_before_act = silu_backprop(dgate, gate_before_act)
+                dhidden = -vi @ w1_now.transpose(-1, -2)  # [b, l, dh] = [b, l, d] @ [b, d, dh]
+                dhidden_before_mul = dhidden * F.silu(gate_before_act, inplace=False)
+                dgate = dhidden * hidden_before_mul
+                dgate_before_act = silu_backprop(dgate, gate_before_act)
 
-            # w1_grad = ((hidden * lr1i).transpose(-1, -2) @ -vi)
-            # w0_grad = ((ki * lr0i).transpose(-1, -2) @ dgate_before_act)
-            # w2_grad = ((ki * lr2i).transpose(-1, -2) @ dhidden_before_mul)
+                w1_grad = ((hidden * lr1i).transpose(-1, -2) @ -vi)
+                w0_grad = ((ki * lr0i).transpose(-1, -2) @ dgate_before_act)
+                w2_grad = ((ki * lr2i).transpose(-1, -2) @ dhidden_before_mul)
+            elif grad_calc_method == "autograd":
+                # use auto-grad to compute the gradient
+                # make sure compute graph tracking is enabled.
+                with torch.enable_grad():
+                    # make a copy of the weights
+                    w1_now_ = w1_now.requires_grad_(True)
+                    w0_now_ = w0_now.requires_grad_(True)
+                    w2_now_ = w2_now.requires_grad_(True)
+                    vpi = fast_weight_swish_glu_fwd(ki, w0_now_, w1_now_, w2_now_)
+                    
+                    if ttt_loss_type == "dot_product":
+                        loss = -vpi * vi
+                    elif ttt_loss_type == "mse":
+                        loss = (vpi - vi)**2
+                    elif ttt_loss_type == "rmse":
+                        loss = torch.sqrt((vpi - vi)**2 + 1e-8)
+                    elif ttt_loss_type == "mae":
+                        loss = torch.abs(vpi - vi)
+                    # some weird loss functions, doesn't have to be regression loss
+                    elif ttt_loss_type == "inv_dot_product":
+                        loss = vpi * vi
+                    elif ttt_loss_type == "inv_mse":
+                        loss = -(vpi - vi)**2
+                    elif ttt_loss_type == "inv_rmse":
+                        loss = -torch.sqrt((vpi - vi)**2 + 1e-8)
+                    elif ttt_loss_type == "inv_mae":
+                        loss = -torch.abs(vpi - vi)
+                    # even more arbitrary functions
+                    elif ttt_loss_type == "vp**2+v":
+                        loss = vpi**2 + vi
+                    elif ttt_loss_type == "vp*v**2":
+                        loss = vpi * vi**2
+                    elif ttt_loss_type == "sin(vp*v)":
+                        loss = torch.sin(vpi * vi)
+                    elif ttt_loss_type == "-(vp**2+v**0.5)**2":
+                        loss = -((vpi**2 + vi**0.5)**2)
+                    elif ttt_loss_type == "exp(vp*v)":
+                        loss = torch.exp(vpi * vi)
+                    # non-binary functions
+                    elif ttt_loss_type == "vp**2":
+                        loss = vpi**2
+                    else:
+                        raise ValueError(f"Unknown ttt_loss_type: {ttt_loss_type}")
 
-            # use auto-grad to compute the gradient
-            # make sure compute graph tracking is enabled.
-            with torch.enable_grad():
-                # make a copy of the weights
-                w1_now_ = w1_now.requires_grad_(True)
-                w0_now_ = w0_now.requires_grad_(True)
-                w2_now_ = w2_now.requires_grad_(True)
-                vpi = fast_weight_swish_glu_fwd(ki, w0_now_, w1_now_, w2_now_)
-                
-                if ttt_loss_type == "dot_product":
-                    loss = -vpi * vi
-                elif ttt_loss_type == "mse":
-                    loss = (vpi - vi)**2
-                elif ttt_loss_type == "rmse":
-                    loss = torch.sqrt((vpi - vi)**2 + 1e-8)
-                elif ttt_loss_type == "mae":
-                    loss = torch.abs(vpi - vi)
-                # some weird loss functions, doesn't have to be regression loss
-                elif ttt_loss_type == "inv_dot_product":
-                    loss = vpi * vi
-                elif ttt_loss_type == "inv_mse":
-                    loss = -(vpi - vi)**2
-                elif ttt_loss_type == "inv_rmse":
-                    loss = -torch.sqrt((vpi - vi)**2 + 1e-8)
-                elif ttt_loss_type == "inv_mae":
-                    loss = -torch.abs(vpi - vi)
-                # even more arbitrary functions
-                elif ttt_loss_type == "vp**2+v":
-                    loss = vpi**2 + vi
-                elif ttt_loss_type == "vp*v**2":
-                    loss = vpi * vi**2
-                elif ttt_loss_type == "sin(vp*v)":
-                    loss = torch.sin(vpi * vi)
-                elif ttt_loss_type == "-(vp**2+v**0.5)**2":
-                    loss = -((vpi**2 + vi**0.5)**2)
-                elif ttt_loss_type == "exp(vp*v)":
-                    loss = torch.exp(vpi * vi)
-                # non-binary functions
-                elif ttt_loss_type == "vp**2":
-                    loss = vpi**2
-                    print(f"using vp**2 loss")
-                elif ttt_loss_type == "v**2":
-                    loss = vi**2
-                else:
-                    raise ValueError(f"Unknown ttt_loss_type: {ttt_loss_type}")
-
-                w1_grad, w0_grad, w2_grad = torch.autograd.grad(
-                    [(lr1i * loss).sum(), (lr0i * loss).sum(), (lr2i * loss).sum()], 
-                    [w1_now_, w0_now_, w2_now_], 
-                    create_graph=True
-                )
+                    w1_grad, w0_grad, w2_grad = torch.autograd.grad(
+                        [(lr1i * loss).sum(), (lr0i * loss).sum(), (lr2i * loss).sum()], 
+                        [w1_now_, w0_now_, w2_now_], 
+                        create_graph=True
+                    )
+            else:
+                raise ValueError(f"Unknown grad_calc_method: {grad_calc_method}")
 
             # orthogonalized gradients
             w1_grad = zeropower_via_newtonschulz5(w1_grad, muon_update_steps)
             w0_grad = zeropower_via_newtonschulz5(w0_grad, muon_update_steps)
             w2_grad = zeropower_via_newtonschulz5(w2_grad, muon_update_steps)
 
-
             w1_now = w1_now - w1_grad
             w0_now = w0_now - w0_grad
             w2_now = w2_now - w2_grad
-
-            # w1_now = w1_now + w1_grad
-            # w0_now = w0_now + w0_grad
-            # w2_now = w2_now + w2_grad
 
             # do weight norm here
             w0_now = w0_now / (w0_now.norm(dim=1, keepdim=True) + 1e-5) * w0_norm
@@ -237,6 +233,7 @@ class FastWeightGluMLPMultihead(nn.Module):
         base_lr=0.01,
         muon_update_steps=0,
         ttt_loss_type="dot_product",
+        grad_calc_method: str = "mannual",
     ):
         super().__init__()
         self.dim = dim
@@ -244,7 +241,8 @@ class FastWeightGluMLPMultihead(nn.Module):
         self.num_heads = dim // head_dim
         self.muon_update_steps = muon_update_steps
         self.ttt_loss_type = ttt_loss_type
-        print(f"TTT loss type: {ttt_loss_type}")
+        self.grad_calc_method = grad_calc_method
+        print(f"TTT loss type: {ttt_loss_type}, grad calculation method: {grad_calc_method}")
 
         d_in = d_out = head_dim
         d_h = int(head_dim * inter_multi)
@@ -304,6 +302,7 @@ class FastWeightGluMLPMultihead(nn.Module):
             w0, w1, w2, q, k, v, lr0, lr1, lr2, info["ttt_op_order"],
             muon_update_steps=self.muon_update_steps,
             ttt_loss_type=self.ttt_loss_type,
+            grad_calc_method=self.grad_calc_method if self.grad_calc_method == "mannual" else "autograd",
         )
 
         output = self.o_norm(output)

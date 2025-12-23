@@ -16,6 +16,7 @@ block_config:
       base_lr: 0.01
       muon_update_steps: 5
       ttt_loss_type: dot_product
+      grad_calc_method: mannual
   - type: model.MLP
     length_dim: vl
     params:

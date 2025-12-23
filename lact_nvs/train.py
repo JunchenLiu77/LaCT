@@ -61,6 +61,7 @@ def main():
 
     # Model config
     parser.add_argument("--ttt_loss_type", type=str, default=None, help="TTT loss type: dot_product, mse, rmse, mae, etc.")
+    parser.add_argument("--grad_calc_method", type=str, default="mannual", help="Gradient calculation method: mannual, autograd")
 
     args = parser.parse_args()
     model_config = omegaconf.OmegaConf.load(args.config)
@@ -69,7 +70,8 @@ def main():
         for block in model_config.block_config:
             if block.type == "lact_ttt.FastWeightGluMLPMultihead":
                 block.params.ttt_loss_type = args.ttt_loss_type
-    
+                block.params.grad_calc_method = args.grad_calc_method
+                
     output_dir = f"output/{args.expname}"
     os.makedirs(output_dir, exist_ok=True)
 
@@ -298,6 +300,7 @@ def main():
                 "compile": args.compile,
                 "actckpt": args.actckpt,
                 "ttt_loss_type": args.ttt_loss_type,
+                "grad_calc_method": args.grad_calc_method,
             },
             resume="allow",
         )
