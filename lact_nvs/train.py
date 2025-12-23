@@ -78,14 +78,32 @@ def main():
     torch.cuda.set_device(ddp_local_rank)
     print(f"[{dist.get_rank():02d}, {ddp_local_rank:02d}] device: {torch.cuda.current_device()}")
 
-    # Seed everything
+    # Seed everything for reproducibility
     rank_specific_seed = 95 + dist.get_rank()
     print(f"[{dist.get_rank():02d}, {ddp_local_rank:02d}] seed: {rank_specific_seed}")
-    torch.manual_seed(rank_specific_seed)
-    np.random.seed(rank_specific_seed)
+    
     random.seed(rank_specific_seed)
+    np.random.seed(rank_specific_seed)
+    torch.manual_seed(rank_specific_seed)
+    torch.cuda.manual_seed(rank_specific_seed)
+    torch.cuda.manual_seed_all(rank_specific_seed)
+    
+    # cuDNN determinism
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
+    
+    # Enable deterministic algorithms
+    os.environ["CUBLAS_WORKSPACE_CONFIG"] = ":4096:8"
+    torch.use_deterministic_algorithms(True)
+    
     dataloader_seed_generator = torch.Generator()
     dataloader_seed_generator.manual_seed(rank_specific_seed)
+    
+    def worker_init_fn(worker_id):
+        """Ensure each DataLoader worker has a unique but reproducible seed."""
+        worker_seed = torch.initial_seed() % 2**32
+        np.random.seed(worker_seed)
+        random.seed(worker_seed)
 
     model = LaCTLVSM(**model_config).cuda()
 
@@ -171,7 +189,7 @@ def main():
         return new_state_dict
 
     # Data
-    train_set = NVSDataset(args.data_path, args.num_all_views, tuple(args.image_size), scene_pose_normalize=args.scene_pose_normalize)
+    train_set = NVSDataset("data_example/dl3dv_10k_sample_data_path.json", args.num_all_views, tuple(args.image_size), scene_pose_normalize=args.scene_pose_normalize)
     train_sampler = DistributedSampler(train_set)
     train_loader = DataLoader(
         train_set,
@@ -188,6 +206,7 @@ def main():
         drop_last=False,
         sampler=train_sampler,
         generator=dataloader_seed_generator,    # This ensures deterministic dataloader
+        worker_init_fn=worker_init_fn,          # Seed workers for reproducibility
     )
 
     if args.test_every > 0:
@@ -212,7 +231,7 @@ def main():
         num_views_for_dataset = args.num_input_views + args.num_target_views
 
         test_set = NVSDataset(
-            args.data_path, 
+            "data_example/dl3dv_benchmark_sample_data_path.json", 
             num_views_for_dataset, 
             tuple(args.image_size), 
             sorted_indices=False,  # Important: false to preserve Input/Target block ordering
@@ -232,6 +251,7 @@ def main():
             prefetch_factor=2, 
             sampler=test_sampler,
             generator=test_dataloader_seed_generator,    # This ensures deterministic dataloader
+            worker_init_fn=worker_init_fn,               # Seed workers for reproducibility
         )
         test_sampler.set_epoch(0)
 

@@ -128,7 +128,8 @@ class NVSDataset(Dataset):
             images_info = json.load(f)
         
         # Determine indices
-        if self.fixed_indices is not None and scene_name in self.fixed_indices:
+        if self.fixed_indices is not None:
+            assert scene_name in self.fixed_indices, f"Scene {scene_name} not found in fixed indices"
             # Use fixed indices provided externally
             indices = self.fixed_indices[scene_name]
             # If fixed_indices are used, we assume they are pre-ordered as desired (e.g. interleaved).

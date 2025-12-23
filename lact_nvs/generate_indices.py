@@ -67,7 +67,7 @@ def generate_indices(data_path, num_input_views, num_target_views, output_dir):
     print(f"Saved test indices to {output_path}")
 
 if __name__ == "__main__":
-    # python generate_indices.py --data_path data_example/dl3dv_10k_sample_data_path.json --num_input_views 32 --num_target_views 32 --output_dir data_example/
+    # python generate_indices.py --data_path data_example/dl3dv_benchmark_sample_data_path.json --num_input_views 32 --num_target_views 32 --output_dir data_example/
     parser = argparse.ArgumentParser()
     parser.add_argument("--data_path", type=str, required=True, help="Path to the data index json file")
     parser.add_argument("--num_input_views", type=int, default=32)
