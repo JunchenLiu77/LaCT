@@ -120,13 +120,18 @@ def fast_weight_swish_glu_weight_norm_mini_batch_apply(
                 gate_before_act = ki @ w0_now       # b[b, l, dh] = [b, l, d] @ [b, d, dh]
                 hidden_before_mul = ki @ w2_now     # b[b, l, dh] = [b, l, d] @ [b, d, dh]
                 hidden = F.silu(gate_before_act, inplace=False) * hidden_before_mul
+                vpi = hidden @ w1_now
 
-                dhidden = -vi @ w1_now.transpose(-1, -2)  # [b, l, dh] = [b, l, d] @ [b, d, dh]
+                if ttt_loss_type == "dot_product":
+                    dvpi = -vi
+                else:
+                    raise NotImplementedError(f"Unknown ttt_loss_type: {ttt_loss_type}")
+                dhidden = dvpi @ w1_now.transpose(-1, -2)  # [b, l, dh] = [b, l, d] @ [b, d, dh]
                 dhidden_before_mul = dhidden * F.silu(gate_before_act, inplace=False)
                 dgate = dhidden * hidden_before_mul
                 dgate_before_act = silu_backprop(dgate, gate_before_act)
 
-                w1_grad = ((hidden * lr1i).transpose(-1, -2) @ -vi)
+                w1_grad = ((hidden * lr1i).transpose(-1, -2) @ dvpi)
                 w0_grad = ((ki * lr0i).transpose(-1, -2) @ dgate_before_act)
                 w2_grad = ((ki * lr2i).transpose(-1, -2) @ dhidden_before_mul)
             elif grad_calc_method == "autograd":
