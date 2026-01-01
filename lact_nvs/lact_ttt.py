@@ -145,6 +145,25 @@ def fast_weight_swish_glu_weight_norm_mini_batch_apply(
                     w1_grad = ((k_hidden * lr1i).transpose(-1, -2) @ dvpi) + ((q_hidden * lr1i).transpose(-1, -2) @ dvpi) * 0.5
                     w0_grad = ((ki * lr0i).transpose(-1, -2) @ k_dgate_before_act) + ((qi * lr0i).transpose(-1, -2) @ q_dgate_before_act) * 0.5
                     w2_grad = ((ki * lr2i).transpose(-1, -2) @ k_dhidden_before_mul) + ((qi * lr2i).transpose(-1, -2) @ q_dhidden_before_mul) * 0.5
+                elif ttt_loss_type == "design2":
+                    # update: MLP(0.5 * q + 0.5 * k) -> v, dot product loss
+                    qi = q[:, start:end, :]
+                    mlp_input = 0.5 * qi + 0.5 * ki
+                    gate_before_act = mlp_input @ w0_now       # b[b, l, dh] = [b, l, d] @ [b, d, dh]
+                    hidden_before_mul = mlp_input @ w2_now     # b[b, l, dh] = [b, l, d] @ [b, d, dh]
+                    hidden = F.silu(gate_before_act, inplace=False) * hidden_before_mul
+                    vpi = hidden @ w1_now
+
+                    dvpi = -vi
+                    
+                    dhidden = dvpi @ w1_now.transpose(-1, -2)  # [b, l, dh] = [b, l, d] @ [b, d, dh]
+                    dhidden_before_mul = dhidden * F.silu(gate_before_act, inplace=False)
+                    dgate = dhidden * hidden_before_mul
+                    dgate_before_act = silu_backprop(dgate, gate_before_act)
+
+                    w1_grad = ((hidden * lr1i).transpose(-1, -2) @ dvpi)
+                    w0_grad = ((mlp_input * lr0i).transpose(-1, -2) @ dgate_before_act)
+                    w2_grad = ((mlp_input * lr2i).transpose(-1, -2) @ dhidden_before_mul)
                 else:
                     # manually compute the gradient
                     gate_before_act = ki @ w0_now       # b[b, l, dh] = [b, l, d] @ [b, d, dh]
@@ -237,12 +256,14 @@ def fast_weight_swish_glu_weight_norm_mini_batch_apply(
         if apply:
             # Only calculate the output in the last repeat.
             qi = q[:, start:end, :]
-            if ttt_loss_type == "design1":
+            if ttt_loss_type in ["design1", "design2"]:
                 # apply: o = MLP(0.5 * q + 0.5 * k)
                 ki = k[:, start:end, :]
                 oi = fast_weight_swish_glu_fwd(0.5 * qi + 0.5 * ki, w0_now, w1_now, w2_now, inplace=True)
-            else:
+            elif ttt_loss_type == "dot_product":
                 oi = fast_weight_swish_glu_fwd(qi, w0_now, w1_now, w2_now, inplace=True)
+            else:
+                raise NotImplementedError(f"Unknown ttt_loss_type: {ttt_loss_type}")
             output.append(oi)
 
     output = torch.cat(output, dim=1)
