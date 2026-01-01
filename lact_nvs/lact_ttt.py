@@ -28,11 +28,10 @@ def silu_backprop(dy: torch.Tensor, x: torch.Tensor):
     dx = dy * sigma * (1 + x * (1 - sigma))
     return dx
 
-# @torch.compile
-def fast_weight_swish_glu_fwd(q: torch.Tensor, w0: torch.Tensor, w1: torch.Tensor, w2: torch.Tensor):
+@torch.compile
+def fast_weight_swish_glu_fwd(q: torch.Tensor, w0: torch.Tensor, w1: torch.Tensor, w2: torch.Tensor, inplace: bool = True):
     # inplace operations will cause memory-hungry when combined with create_graph=True
-    # return F.silu(q @ w0, inplace=True) * (q @ w2) @ w1
-    return F.silu(q @ w0, inplace=False) * (q @ w2) @ w1
+    return (F.silu(q @ w0, inplace=inplace) * (q @ w2)) @ w1
 
 
 @torch.compile
@@ -73,7 +72,7 @@ def zeropower_via_newtonschulz5(G, steps):
     return X
 
 
-# @torch.compile
+@torch.compile
 def fast_weight_swish_glu_weight_norm_mini_batch_apply(
     w0: torch.Tensor,
     w1: torch.Tensor,
@@ -116,73 +115,106 @@ def fast_weight_swish_glu_weight_norm_mini_batch_apply(
             lr2i = lr2[:, start:end, :]  # [b, l, d/1] fp32
 
             if grad_calc_method == "mannual":
-                # manually compute the gradient
-                gate_before_act = ki @ w0_now       # b[b, l, dh] = [b, l, d] @ [b, d, dh]
-                hidden_before_mul = ki @ w2_now     # b[b, l, dh] = [b, l, d] @ [b, d, dh]
-                hidden = F.silu(gate_before_act, inplace=False) * hidden_before_mul
-                vpi = hidden @ w1_now
+                if ttt_loss_type == "design1":
+                    # update: 0.5 * MLP(q) + 0.5 * MLP(k) -> v, dot product loss
+                    k_gate_before_act = ki @ w0_now       # b[b, l, dh] = [b, l, d] @ [b, d, dh]
+                    k_hidden_before_mul = ki @ w2_now     # b[b, l, dh] = [b, l, d] @ [b, d, dh]
+                    k_hidden = F.silu(k_gate_before_act, inplace=False) * k_hidden_before_mul
+                    k_vpi = k_hidden @ w1_now
 
-                if ttt_loss_type == "dot_product":
+                    qi = q[:, start:end, :]
+                    q_gate_before_act = qi @ w0_now       # b[b, l, dh] = [b, l, d] @ [b, d, dh]
+                    q_hidden_before_mul = qi @ w2_now     # b[b, l, dh] = [b, l, d] @ [b, d, dh]
+                    q_hidden = F.silu(q_gate_before_act, inplace=False) * q_hidden_before_mul
+                    q_vpi = q_hidden @ w1_now
+
+                    # vpi = 0.5 * q_vpi + 0.5 * k_vpi
+                    # dot product loss: -vpi * vi
                     dvpi = -vi
-                else:
-                    raise NotImplementedError(f"Unknown ttt_loss_type: {ttt_loss_type}")
-                dhidden = dvpi @ w1_now.transpose(-1, -2)  # [b, l, dh] = [b, l, d] @ [b, d, dh]
-                dhidden_before_mul = dhidden * F.silu(gate_before_act, inplace=False)
-                dgate = dhidden * hidden_before_mul
-                dgate_before_act = silu_backprop(dgate, gate_before_act)
+                    
+                    k_dhidden = dvpi @ w1_now.transpose(-1, -2)  # [b, l, dh] = [b, l, d] @ [b, d, dh]
+                    k_dhidden_before_mul = k_dhidden * F.silu(k_gate_before_act, inplace=False)
+                    k_dgate = k_dhidden * k_hidden_before_mul
+                    k_dgate_before_act = silu_backprop(k_dgate, k_gate_before_act)
 
-                w1_grad = ((hidden * lr1i).transpose(-1, -2) @ dvpi)
-                w0_grad = ((ki * lr0i).transpose(-1, -2) @ dgate_before_act)
-                w2_grad = ((ki * lr2i).transpose(-1, -2) @ dhidden_before_mul)
+                    q_dhidden = dvpi @ w1_now.transpose(-1, -2)  # [b, l, dh] = [b, l, d] @ [b, d, dh]
+                    q_dhidden_before_mul = q_dhidden * F.silu(q_gate_before_act, inplace=False)
+                    q_dgate = q_dhidden * q_hidden_before_mul
+                    q_dgate_before_act = silu_backprop(q_dgate, q_gate_before_act)
+
+                    w1_grad = ((k_hidden * lr1i).transpose(-1, -2) @ dvpi) + ((q_hidden * lr1i).transpose(-1, -2) @ dvpi) * 0.5
+                    w0_grad = ((ki * lr0i).transpose(-1, -2) @ k_dgate_before_act) + ((qi * lr0i).transpose(-1, -2) @ q_dgate_before_act) * 0.5
+                    w2_grad = ((ki * lr2i).transpose(-1, -2) @ k_dhidden_before_mul) + ((qi * lr2i).transpose(-1, -2) @ q_dhidden_before_mul) * 0.5
+                else:
+                    # manually compute the gradient
+                    gate_before_act = ki @ w0_now       # b[b, l, dh] = [b, l, d] @ [b, d, dh]
+                    hidden_before_mul = ki @ w2_now     # b[b, l, dh] = [b, l, d] @ [b, d, dh]
+                    hidden = F.silu(gate_before_act, inplace=False) * hidden_before_mul
+                    vpi = hidden @ w1_now
+
+                    if ttt_loss_type == "dot_product":
+                        dvpi = -vi
+                    else:
+                        raise NotImplementedError(f"Unknown ttt_loss_type: {ttt_loss_type}")
+                    
+                    dhidden = dvpi @ w1_now.transpose(-1, -2)  # [b, l, dh] = [b, l, d] @ [b, d, dh]
+                    dhidden_before_mul = dhidden * F.silu(gate_before_act, inplace=False)
+                    dgate = dhidden * hidden_before_mul
+                    dgate_before_act = silu_backprop(dgate, gate_before_act)
+
+                    w1_grad = ((hidden * lr1i).transpose(-1, -2) @ dvpi)
+                    w0_grad = ((ki * lr0i).transpose(-1, -2) @ dgate_before_act)
+                    w2_grad = ((ki * lr2i).transpose(-1, -2) @ dhidden_before_mul)
             elif grad_calc_method == "autograd":
                 # use auto-grad to compute the gradient
+                raise NotImplementedError("To compile this function, we comment out the autograd code")
                 # make sure compute graph tracking is enabled.
-                with torch.enable_grad():
-                    # make a copy of the weights
-                    w1_now_ = w1_now.requires_grad_(True)
-                    w0_now_ = w0_now.requires_grad_(True)
-                    w2_now_ = w2_now.requires_grad_(True)
-                    vpi = fast_weight_swish_glu_fwd(ki, w0_now_, w1_now_, w2_now_)
+                # with torch.enable_grad():
+                #     # make a copy of the weights
+                #     w1_now_ = w1_now.requires_grad_(True)
+                #     w0_now_ = w0_now.requires_grad_(True)
+                #     w2_now_ = w2_now.requires_grad_(True)
+                #     vpi = fast_weight_swish_glu_fwd(ki, w0_now_, w1_now_, w2_now_, inplace=False)
                     
-                    if ttt_loss_type == "dot_product":
-                        loss = -vpi * vi
-                    elif ttt_loss_type == "mse":
-                        loss = (vpi - vi)**2
-                    elif ttt_loss_type == "rmse":
-                        loss = torch.sqrt((vpi - vi)**2 + 1e-8)
-                    elif ttt_loss_type == "mae":
-                        loss = torch.abs(vpi - vi)
-                    # some weird loss functions, doesn't have to be regression loss
-                    elif ttt_loss_type == "inv_dot_product":
-                        loss = vpi * vi
-                    elif ttt_loss_type == "inv_mse":
-                        loss = -(vpi - vi)**2
-                    elif ttt_loss_type == "inv_rmse":
-                        loss = -torch.sqrt((vpi - vi)**2 + 1e-8)
-                    elif ttt_loss_type == "inv_mae":
-                        loss = -torch.abs(vpi - vi)
-                    # even more arbitrary functions
-                    elif ttt_loss_type == "vp**2+v":
-                        loss = vpi**2 + vi
-                    elif ttt_loss_type == "vp*v**2":
-                        loss = vpi * vi**2
-                    elif ttt_loss_type == "sin(vp*v)":
-                        loss = torch.sin(vpi * vi)
-                    elif ttt_loss_type == "-(vp**2+v**0.5)**2":
-                        loss = -((vpi**2 + vi**0.5)**2)
-                    elif ttt_loss_type == "exp(vp*v)":
-                        loss = torch.exp(vpi * vi)
-                    # non-binary functions
-                    elif ttt_loss_type == "vp**2":
-                        loss = vpi**2
-                    else:
-                        raise ValueError(f"Unknown ttt_loss_type: {ttt_loss_type}")
+                #     if ttt_loss_type == "dot_product":
+                #         loss = -vpi * vi
+                #     elif ttt_loss_type == "mse":
+                #         loss = (vpi - vi)**2
+                #     elif ttt_loss_type == "rmse":
+                #         loss = torch.sqrt((vpi - vi)**2 + 1e-8)
+                #     elif ttt_loss_type == "mae":
+                #         loss = torch.abs(vpi - vi)
+                #     # some weird loss functions, doesn't have to be regression loss
+                #     elif ttt_loss_type == "inv_dot_product":
+                #         loss = vpi * vi
+                #     elif ttt_loss_type == "inv_mse":
+                #         loss = -(vpi - vi)**2
+                #     elif ttt_loss_type == "inv_rmse":
+                #         loss = -torch.sqrt((vpi - vi)**2 + 1e-8)
+                #     elif ttt_loss_type == "inv_mae":
+                #         loss = -torch.abs(vpi - vi)
+                #     # even more arbitrary functions
+                #     elif ttt_loss_type == "vp**2+v":
+                #         loss = vpi**2 + vi
+                #     elif ttt_loss_type == "vp*v**2":
+                #         loss = vpi * vi**2
+                #     elif ttt_loss_type == "sin(vp*v)":
+                #         loss = torch.sin(vpi * vi)
+                #     elif ttt_loss_type == "-(vp**2+v**0.5)**2":
+                #         loss = -((vpi**2 + vi**0.5)**2)
+                #     elif ttt_loss_type == "exp(vp*v)":
+                #         loss = torch.exp(vpi * vi)
+                #     # non-binary functions
+                #     elif ttt_loss_type == "vp**2":
+                #         loss = vpi**2
+                #     else:
+                #         raise ValueError(f"Unknown ttt_loss_type: {ttt_loss_type}")
 
-                    w1_grad, w0_grad, w2_grad = torch.autograd.grad(
-                        [(lr1i * loss).sum(), (lr0i * loss).sum(), (lr2i * loss).sum()], 
-                        [w1_now_, w0_now_, w2_now_], 
-                        create_graph=True
-                    )
+                #     w1_grad, w0_grad, w2_grad = torch.autograd.grad(
+                #         [(lr1i * loss).sum(), (lr0i * loss).sum(), (lr2i * loss).sum()], 
+                #         [w1_now_, w0_now_, w2_now_], 
+                #         create_graph=True
+                #     )
             else:
                 raise ValueError(f"Unknown grad_calc_method: {grad_calc_method}")
 
@@ -205,7 +237,12 @@ def fast_weight_swish_glu_weight_norm_mini_batch_apply(
         if apply:
             # Only calculate the output in the last repeat.
             qi = q[:, start:end, :]
-            oi = fast_weight_swish_glu_fwd(qi, w0_now, w1_now, w2_now)
+            if ttt_loss_type == "design1":
+                # apply: o = MLP(0.5 * q + 0.5 * k)
+                ki = k[:, start:end, :]
+                oi = fast_weight_swish_glu_fwd(0.5 * qi + 0.5 * ki, w0_now, w1_now, w2_now, inplace=True)
+            else:
+                oi = fast_weight_swish_glu_fwd(qi, w0_now, w1_now, w2_now, inplace=True)
             output.append(oi)
 
     output = torch.cat(output, dim=1)
