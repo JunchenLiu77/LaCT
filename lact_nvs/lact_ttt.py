@@ -9,6 +9,8 @@ from einops import rearrange
 
 TTTOperator = collections.namedtuple("TTTOperator", ["start", "end", "update", "apply"])
 
+VISUALIZE = False
+
 @torch.compile
 def inv_softplus(x):
     y = x + math.log(-math.expm1(-x))
@@ -83,6 +85,7 @@ def fast_weight_swish_glu_weight_norm_mini_batch_apply(
     lr0: torch.Tensor,
     lr1: torch.Tensor,
     lr2: torch.Tensor,
+    block_idx: int,
     ttt_ua_order: list,
     muon_update_steps: int = 0,
     ttt_loss_type: str = "dot_product",
@@ -266,6 +269,20 @@ def fast_weight_swish_glu_weight_norm_mini_batch_apply(
                 raise NotImplementedError(f"Unknown ttt_loss_type: {ttt_loss_type}")
             output.append(oi)
 
+            if VISUALIZE:
+                ki = k[:, start:end, :]
+                vi = v[:, start:end, :]
+                vpi = (F.silu(ki @ w0_now) * (ki @ w2_now)) @ w1_now
+
+                import os
+                os.makedirs(f"output/vis/{ttt_loss_type}/{block_idx}", exist_ok=True)
+                torch.save(qi, f"output/vis/{ttt_loss_type}/{block_idx}/q.pt")
+                torch.save(ki, f"output/vis/{ttt_loss_type}/{block_idx}/k.pt")
+                torch.save(vi, f"output/vis/{ttt_loss_type}/{block_idx}/v.pt")
+                torch.save(oi, f"output/vis/{ttt_loss_type}/{block_idx}/o.pt")
+                torch.save(vpi, f"output/vis/{ttt_loss_type}/{block_idx}/vp.pt")
+                print(f"Saved visualization for block {block_idx} to output/vis/{ttt_loss_type}/{block_idx}")
+
     output = torch.cat(output, dim=1)
 
     return output, w0, w1, w2
@@ -291,6 +308,7 @@ class FastWeightGluMLPMultihead(nn.Module):
         self,
         dim: int,
         head_dim: int,
+        block_idx: int,
         inter_multi: int = 1,
         bias: bool = False,
         base_lr=0.01,
@@ -306,6 +324,8 @@ class FastWeightGluMLPMultihead(nn.Module):
         self.ttt_loss_type = ttt_loss_type
         self.grad_calc_method = grad_calc_method
         print(f"TTT loss type: {ttt_loss_type}, grad calculation method: {grad_calc_method}")
+
+        self.block_idx = block_idx
 
         d_in = d_out = head_dim
         d_h = int(head_dim * inter_multi)
@@ -362,7 +382,7 @@ class FastWeightGluMLPMultihead(nn.Module):
             w2 = self.w2.repeat(x.shape[0], 1, 1)
 
         output, w0, w1, w2 = fast_weight_swish_glu_weight_norm_mini_batch_apply(
-            w0, w1, w2, q, k, v, lr0, lr1, lr2, info["ttt_op_order"],
+            w0, w1, w2, q, k, v, lr0, lr1, lr2, self.block_idx, info["ttt_op_order"],
             muon_update_steps=self.muon_update_steps,
             ttt_loss_type=self.ttt_loss_type,
             grad_calc_method=self.grad_calc_method if self.grad_calc_method == "mannual" else "autograd",

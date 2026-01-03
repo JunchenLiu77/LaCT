@@ -93,17 +93,18 @@ class MLP(nn.Module):
 
 
 class Block(nn.Module):
-    def __init__(self, dim, bias, block_config):
+    def __init__(self, dim, bias, block_idx, block_config):
         super().__init__()
         module_list = []
         self.length_dim_list = []
+        self.block_idx = block_idx
 
         for _, module_config in enumerate(block_config):
             CLASS = get_class_by_name(module_config["type"])
             module = nn.ModuleDict(
                 {
                     "ln": LayerNorm(dim, bias=bias),
-                    "f": CLASS(dim=dim, bias=bias, **module_config["params"]),
+                    "f": CLASS(dim=dim, bias=bias, block_idx=self.block_idx, **module_config["params"]) if "lact_ttt" in module_config["type"].lower() else CLASS(dim=dim, bias=bias, **module_config["params"]),
                 }
             )
 
@@ -184,8 +185,8 @@ class LaCTLVSM(nn.Module):
         self.input_linear = nn.Linear(self.input_dim * (self.patch_size**2), self.dim, bias=False)
         self.input_layernorm = nn.LayerNorm(self.dim, bias=False)
         self.blocks = nn.ModuleList([
-            Block(dim=self.dim, bias=False, block_config=block_config)
-            for _ in range(layers)
+            Block(dim=self.dim, bias=False, block_idx=i, block_config=block_config)
+            for i in range(layers)
         ])
 
         self.image_token_decoder = nn.Sequential(
@@ -254,6 +255,8 @@ class LaCTLVSM(nn.Module):
         x = self.input_layernorm(x)
         for block in self.blocks:
             x, _ = block(x, info)
+
+        # exit()
         
         target_x = x[:, -num_target_tokens:]
         target_x = self.image_token_decoder(target_x)
