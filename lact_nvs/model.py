@@ -8,7 +8,7 @@ import torch.nn as nn
 from torch.nn import LayerNorm
 from torch.nn import functional as F
 
-from lact_ttt import TTTOperator
+from lact_ttt import TTTOperator, TTTOperator_fused
 
 def get_class_by_name(name):
     parts = name.split(".")
@@ -177,6 +177,7 @@ class LaCTLVSM(nn.Module):
         super().__init__()
         self.patch_size = patch_size
         self.dim = dim
+        self.block_config = block_config
 
         self.pose_keys = ["ray_o", "ray_d", "o_cross_d"]
         self.posed_image_keys = self.pose_keys + ["normalized_image"]
@@ -236,10 +237,13 @@ class LaCTLVSM(nn.Module):
         num_img_tokens = h * w // (self.patch_size**2)
         num_input_tokens = num_input_views * num_img_tokens
         num_target_tokens = num_target_views * num_img_tokens
-        ttt_op_order = [
-            TTTOperator(start=0, end=num_input_tokens, update=True, apply=False),
-            TTTOperator(start=0, end=num_input_tokens + num_target_tokens, update=False, apply=True),
-        ]
+        ttt_op_order = []
+        if self.block_config[1]["params"]["use_fused"]:
+            ttt_op_order.append(TTTOperator_fused(num_update_tokens=num_input_tokens, num_apply_tokens=num_input_tokens + num_target_tokens))
+        else:
+            ttt_op_order.append(TTTOperator(start=0, end=num_input_tokens, update=True, apply=False))
+            ttt_op_order.append(TTTOperator(start=0, end=num_input_tokens + num_target_tokens, update=False, apply=True))
+
         info = {
             "ttt_op_order": ttt_op_order,
             "num_img_tokens": num_img_tokens,

@@ -17,6 +17,8 @@ block_config:
       muon_update_steps: 5
       ttt_loss_type: dot_product
       grad_calc_method: mannual
+      no_query: false
+      use_fused: false
   - type: model.MLP
     length_dim: vl
     params:

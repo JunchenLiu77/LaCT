@@ -87,6 +87,8 @@ class Generator:
             gpus = args.gpus if args.gpus is not None else 2
             base = f"torchrun --nproc_per_node={gpus} --standalone train.py --config {config_file}"
             # Add remaining training CLI options
+            if args.seed is not None:
+                base += f" --seed {args.seed}"
             if args.expname:
                 base += f" --expname='{args.expname}'"
             if args.data_path:
@@ -137,6 +139,10 @@ class Generator:
                 base += f" --ttt_loss_type='{args.ttt_loss_type}'"
             if args.grad_calc_method is not None:
                 base += f" --grad_calc_method='{args.grad_calc_method}'"
+            if args.no_query:
+                base += " --no_query"
+            if args.use_fused:
+                base += " --use_fused"
             run_cmd = f"srun --time {args.time or self.slurm_defaults['time']} uv run {base}"
 
         # Generate the script content
@@ -253,6 +259,8 @@ def main():
                         help='First N samples to process')
     parser.add_argument('--test-bs-per-gpu', type=int,
                         help='Test batch size')
+    parser.add_argument('--seed', type=int,
+                        help='Seed')
     
     # Training-only arguments
     parser.add_argument('--save-every', type=int,
@@ -300,6 +308,11 @@ def main():
     parser.add_argument('--grad-calc-method', type=str,
                         choices=['mannual', 'autograd'],
                         help='Gradient calculation method: mannual, autograd')
+    parser.add_argument('--no-query', action='store_true',
+                        help='No query in TTT')
+    parser.add_argument('--use-fused', action='store_true',
+                        help='Use fused TTT')
+
     # Other options
     parser.add_argument('--dry-run', action='store_true',
                         help='Print script without saving')

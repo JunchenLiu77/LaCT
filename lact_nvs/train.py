@@ -33,6 +33,7 @@ def main():
     parser.add_argument("--data_path", type=str, default="data_example/gso_sample_data_path.json")
     parser.add_argument("--save_every", type=int, default=1000)
     parser.add_argument("--log_every", type=int, default=100)
+    parser.add_argument("--seed", type=int, default=95)
 
     # Training
     parser.add_argument("--compile", action="store_true")
@@ -62,15 +63,23 @@ def main():
     # Model config
     parser.add_argument("--ttt_loss_type", type=str, default=None, help="TTT loss type: dot_product, mse, rmse, mae, etc.")
     parser.add_argument("--grad_calc_method", type=str, default="mannual", help="Gradient calculation method: mannual, autograd")
-
+    parser.add_argument("--use_fused", action="store_true", help="Use fused TTT")
+    parser.add_argument("--no_query", action="store_true", help="No query in TTT")
+    
     args = parser.parse_args()
     model_config = omegaconf.OmegaConf.load(args.config)
 
-    if args.ttt_loss_type is not None:
+    if args.ttt_loss_type is not None or args.grad_calc_method is not None or args.no_query is not None or args.use_fused is not None:
         for block in model_config.block_config:
             if block.type == "lact_ttt.FastWeightGluMLPMultihead":
-                block.params.ttt_loss_type = args.ttt_loss_type
-                block.params.grad_calc_method = args.grad_calc_method
+                if args.ttt_loss_type is not None:
+                    block.params.ttt_loss_type = args.ttt_loss_type
+                if args.grad_calc_method is not None:
+                    block.params.grad_calc_method = args.grad_calc_method
+                if args.no_query is not None:
+                    block.params.no_query = args.no_query
+                if args.use_fused is not None:
+                    block.params.use_fused = args.use_fused
                 
     output_dir = f"output/{args.expname}"
     os.makedirs(output_dir, exist_ok=True)
@@ -81,7 +90,7 @@ def main():
     print(f"[{dist.get_rank():02d}, {ddp_local_rank:02d}] device: {torch.cuda.current_device()}")
 
     # Seed everything for reproducibility
-    rank_specific_seed = 95 + dist.get_rank()
+    rank_specific_seed = args.seed + dist.get_rank()
     print(f"[{dist.get_rank():02d}, {ddp_local_rank:02d}] seed: {rank_specific_seed}")
     
     random.seed(rank_specific_seed)
@@ -301,6 +310,8 @@ def main():
                 "actckpt": args.actckpt,
                 "ttt_loss_type": args.ttt_loss_type,
                 "grad_calc_method": args.grad_calc_method,
+                "no_query": args.no_query,
+                "use_fused": args.use_fused,
             },
             resume="allow",
         )
