@@ -110,6 +110,9 @@ class NVSDataset(Dataset):
         filtered_num_scenes = len(self.data_point_paths)
         print(f"Found {original_num_scenes} scenes in the index file, filtered out {original_num_scenes - filtered_num_scenes} scenes with less than {num_views} images, remaining {filtered_num_scenes} scenes")
 
+        # except for rendering video, at both training and inference time we always don't need to sort the indices
+        assert not sorted_indices, "Except for rendering video, at both training and inference time we always don't need to sort the indices"
+
         self.num_views = num_views
         if isinstance(image_size, int):
             self.image_size = (image_size, image_size)
@@ -129,9 +132,20 @@ class NVSDataset(Dataset):
         
         # Determine indices
         if self.fixed_indices is not None:
-            assert scene_name in self.fixed_indices, f"Scene {scene_name} not found in fixed indices"
+            # assert scene_name in self.fixed_indices, f"Scene {scene_name} not found in fixed indices"
             # Use fixed indices provided externally
-            indices = self.fixed_indices[scene_name]
+            # indices = self.fixed_indices[scene_name]
+
+            # use Long-LRM input indices
+            input_indices = self.fixed_indices[index][f"fold_8_kmeans_{self.num_views // 2}_input"]
+            
+            # Uniformly select target indices from the all views
+            num_targets = self.num_views // 2
+            total_views = len(images_info)
+            step = total_views // num_targets
+            target_indices = [int(i * step + step // 2) for i in range(num_targets)]
+            indices = input_indices + target_indices
+
             # If fixed_indices are used, we assume they are pre-ordered as desired (e.g. interleaved).
             # We do NOT sort them unless sorted_indices is explicitly True, but typically we turn it off.
             if self.sorted_indices:

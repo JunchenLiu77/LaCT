@@ -223,14 +223,19 @@ def main():
     if args.test_every > 0:
         # Load fixed test indices
         num_total_needed = args.num_input_views + args.num_target_views
-        fixed_indices_filename = f"test_indices_in{args.num_input_views}_tar{args.num_target_views}.json"
-        fixed_indices_path = os.path.join("data_example", fixed_indices_filename)
+        # fixed_indices_filename = f"test_indices_in{args.num_input_views}_tar{args.num_target_views}.json"
+        # fixed_indices_path = os.path.join("data_example", fixed_indices_filename)
         
-        assert os.path.exists(fixed_indices_path), (
-            f"Fixed test indices file not found at {fixed_indices_path}. "
-            f"Please run `python lact_nvs/generate_indices.py --data_path {args.data_path} "
-            f"--num_input_views {args.num_input_views} --num_target_views {args.num_target_views}` first."
-        )
+        # assert os.path.exists(fixed_indices_path), (
+        #     f"Fixed test indices file not found at {fixed_indices_path}. "
+        #     f"Please run `python lact_nvs/generate_indices.py --data_path {args.data_path} "
+        #     f"--num_input_views {args.num_input_views} --num_target_views {args.num_target_views}` first."
+        # )
+        # use Long-LRM input indices
+        fixed_indices_path = "data_example/dl3dv_fold_8_kmeans_input.json"
+        assert os.path.exists(fixed_indices_path), f"Fixed test indices file not found at {fixed_indices_path}"
+        assert args.num_target_views == args.num_input_views, "we assume the number of target views is the same in dataset."
+        assert args.num_target_views in [16, 32, 64, 128], "input indice file only contains 16, 32, 64, 128 views."
         
         if dist.get_rank() == 0:
             print(f"Loading fixed test indices from {fixed_indices_path}")
