@@ -217,8 +217,6 @@ def fast_weight_swish_glu_weight_norm_mini_batch_apply(
 
         if apply:
             # Only calculate the output in the last repeat.
-            
-            
             if ttt_loss_type in ["design1", "design2"]:
                 # apply: o = MLP(0.5 * q + 0.5 * k)
                 qi = q[:, start:end, :]
@@ -287,7 +285,6 @@ def fast_weight_swish_glu_weight_norm_mini_batch_apply_fused(
     v: [b, l, d]
     lr0, lr1, lr2: [b, l, 1]
     """
-    assert grad_calc_method == "mannual", "Only manual gradient calculation is supported for fused version"
     
     w0_norm = w0.detach().norm(dim=1, keepdim=True)
     w1_norm = w1.detach().norm(dim=1, keepdim=True)
@@ -312,7 +309,7 @@ def fast_weight_swish_glu_weight_norm_mini_batch_apply_fused(
         hidden = F.silu(gate_before_act, inplace=False) * hidden_before_mul
         vpi = hidden @ w1_now
 
-        if ttt_loss_type == "dot_product":
+        if ttt_loss_type in ["dot_product", "ga_dot_product"]:
             dvpi = -vi
         else:
             raise NotImplementedError(f"Unknown ttt_loss_type: {ttt_loss_type}")
@@ -325,33 +322,69 @@ def fast_weight_swish_glu_weight_norm_mini_batch_apply_fused(
         w1_grad = ((hidden * lr1i).transpose(-1, -2) @ dvpi)
         w0_grad = ((ki * lr0i).transpose(-1, -2) @ dgate_before_act)
         w2_grad = ((ki * lr2i).transpose(-1, -2) @ dhidden_before_mul)
+
+        if "ga" in ttt_loss_type:
+            w1_grad = -w1_grad
+            w0_grad = -w0_grad
+            w2_grad = -w2_grad
+    elif grad_calc_method == "unroll1":
+        # unroll the gradient calculation formula, assume using dot-product loss
+        w1_grad = ((F.silu(ki @ w0_now, inplace=False) * (ki @ w2_now)) * lr1i).transpose(-1, -2) @ -vi
+        w0_grad = (ki * lr0i).transpose(-1, -2) @ silu_backprop((-vi @ w1_now.transpose(-1, -2)) * (ki @ w2_now), ki @ w0_now)
+        w2_grad = (ki * lr2i).transpose(-1, -2) @ ((-vi @ w1_now.transpose(-1, -2)) * F.silu(ki @ w0_now, inplace=False))
+    elif grad_calc_method == "simplify1":
+        # remove activation function in w1_grad
+        w1_grad = (((ki @ w0_now) * (ki @ w2_now)) * lr1i).transpose(-1, -2) @ -vi
+        w0_grad = (ki * lr0i).transpose(-1, -2) @ silu_backprop((-vi @ w1_now.transpose(-1, -2)) * (ki @ w2_now), ki @ w0_now)
+        w2_grad = (ki * lr2i).transpose(-1, -2) @ ((-vi @ w1_now.transpose(-1, -2)) * F.silu(ki @ w0_now, inplace=False))
+    elif grad_calc_method == "simplify2":
+        # based on simplify1, remove activation function in w2_grad
+        w1_grad = (((ki @ w0_now) * (ki @ w2_now)) * lr1i).transpose(-1, -2) @ -vi
+        w0_grad = (ki * lr0i).transpose(-1, -2) @ silu_backprop((-vi @ w1_now.transpose(-1, -2)) * (ki @ w2_now), ki @ w0_now)
+        w2_grad = (ki * lr2i).transpose(-1, -2) @ ((-vi @ w1_now.transpose(-1, -2)) * (ki @ w0_now))
+    elif grad_calc_method == "simplify3":
+        # based on simplify2, replace silu_backprop with dy * x
+        w1_grad = (((ki @ w0_now) * (ki @ w2_now)) * lr1i).transpose(-1, -2) @ -vi
+        w0_grad = (ki * lr0i).transpose(-1, -2) @ ((-vi @ w1_now.transpose(-1, -2)) * (ki @ w2_now) * (ki @ w0_now))
+        w2_grad = (ki * lr2i).transpose(-1, -2) @ ((-vi @ w1_now.transpose(-1, -2)) * (ki @ w0_now))
+    elif grad_calc_method == "simplify4":
+        # based on simplify2, replace silu_backprop with dy * x * (1 + x * (1 - x))
+        w1_grad = (((ki @ w0_now) * (ki @ w2_now)) * lr1i).transpose(-1, -2) @ -vi
+        w0_grad = (ki * lr0i).transpose(-1, -2) @ ((-vi @ w1_now.transpose(-1, -2)) * (ki @ w2_now) * (ki @ w0_now) * (1 + (ki @ w0_now) * (1 - (ki @ w0_now))))
+        w2_grad = (ki * lr2i).transpose(-1, -2) @ ((-vi @ w1_now.transpose(-1, -2)) * (ki @ w0_now))
+    elif grad_calc_method == "simplify5":
+        # based on simplify2, replace silu_backprop with silu
+        w1_grad = (((ki @ w0_now) * (ki @ w2_now)) * lr1i).transpose(-1, -2) @ -vi
+        w0_grad = (ki * lr0i).transpose(-1, -2) @ ((-vi @ w1_now.transpose(-1, -2)) * (ki @ w2_now) * F.silu(ki @ w0_now, inplace=False))
+        w2_grad = (ki * lr2i).transpose(-1, -2) @ ((-vi @ w1_now.transpose(-1, -2)) * (ki @ w0_now))
     else:
         raise ValueError(f"Unknown grad_calc_method: {grad_calc_method}")
 
-    # orthogonalized gradients
-    w1_grad = zeropower_via_newtonschulz5(w1_grad, muon_update_steps)
-    w0_grad = zeropower_via_newtonschulz5(w0_grad, muon_update_steps)
-    w2_grad = zeropower_via_newtonschulz5(w2_grad, muon_update_steps)
+    if grad_calc_method != "unroll2":
+        # orthogonalized gradients
+        w1_grad = zeropower_via_newtonschulz5(w1_grad, muon_update_steps)
+        w0_grad = zeropower_via_newtonschulz5(w0_grad, muon_update_steps)
+        w2_grad = zeropower_via_newtonschulz5(w2_grad, muon_update_steps)
 
-    w1_now = w1_now - w1_grad
-    w0_now = w0_now - w0_grad
-    w2_now = w2_now - w2_grad
+        w1_now = w1_now - w1_grad
+        w0_now = w0_now - w0_grad
+        w2_now = w2_now - w2_grad
 
-    # do weight norm here
-    w0_now = w0_now / (w0_now.norm(dim=1, keepdim=True) + 1e-5) * w0_norm
-    w1_now = w1_now / (w1_now.norm(dim=1, keepdim=True) + 1e-5) * w1_norm
-    w2_now = w2_now / (w2_now.norm(dim=1, keepdim=True) + 1e-5) * w2_norm
+        # do weight norm here
+        w0_now = w0_now / (w0_now.norm(dim=1, keepdim=True) + 1e-5) * w0_norm
+        w1_now = w1_now / (w1_now.norm(dim=1, keepdim=True) + 1e-5) * w1_norm
+        w2_now = w2_now / (w2_now.norm(dim=1, keepdim=True) + 1e-5) * w2_norm
 
-    w0, w1, w2 = w0_now, w1_now, w2_now
+        w0, w1, w2 = w0_now, w1_now, w2_now
 
-    # apply
-    if no_query:
-        # reuse k as q when apply
-        ki = k[:, :num_apply_tokens, :]
-        oi = fast_weight_swish_glu_fwd(ki, w0_now, w1_now, w2_now, inplace=True)
-    else:
-        qi = q[:, :num_apply_tokens, :]
-        oi = fast_weight_swish_glu_fwd(qi, w0_now, w1_now, w2_now, inplace=True)
+        # apply
+        if no_query:
+            # reuse k as q when apply
+            ki = k[:, :num_apply_tokens, :]
+            oi = fast_weight_swish_glu_fwd(ki, w0_now, w1_now, w2_now, inplace=True)
+        else:
+            qi = q[:, :num_apply_tokens, :]
+            oi = fast_weight_swish_glu_fwd(qi, w0_now, w1_now, w2_now, inplace=True)
     output.append(oi)
 
     if VISUALIZE:

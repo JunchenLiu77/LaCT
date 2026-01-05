@@ -306,8 +306,7 @@ def main():
     parser.add_argument('--ttt-loss-type', type=str,
                         help='TTT loss type: dot_product, mse, rmse, mae, cosine, inv_dot_product, inv_mse, inv_rmse, inv_mae, inv_cosine')
     parser.add_argument('--grad-calc-method', type=str,
-                        choices=['mannual', 'autograd'],
-                        help='Gradient calculation method: mannual, autograd')
+                        help='Gradient calculation method: mannual, unroll1 etc.')
     parser.add_argument('--no-query', action='store_true',
                         help='No query in TTT')
     parser.add_argument('--use-fused', action='store_true',
