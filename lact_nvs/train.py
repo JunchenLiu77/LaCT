@@ -514,7 +514,7 @@ def main():
 
             # Gradident safeguard
             skip_optimizer_step = False
-            if now_iters > 1000:
+            if now_iters >= 0:
                 global_grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip).item()
 
                 if not math.isfinite(global_grad_norm):
@@ -541,7 +541,7 @@ def main():
                         "train/iter": now_iters,
                         "train/epoch": epoch,
                     }
-                    if now_iters > 1000:
+                    if now_iters > 0:
                         log_dict["train/grad_norm"] = global_grad_norm
                         log_dict["train/skip_optimizer_step"] = int(skip_optimizer_step)
                     wandb.log(log_dict, step=now_iters)
