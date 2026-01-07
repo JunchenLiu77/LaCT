@@ -31,6 +31,7 @@ class Generator:
             'lact_l24_d768_ttt2x': 'config/lact_l24_d768_ttt2x.yaml',
             'lact_l24_d768_ttt4x': 'config/lact_l24_d768_ttt4x.yaml',
             'lact_l12_d768_ttt2x': 'config/lact_l12_d768_ttt2x.yaml',
+            'lact_l18_d768_ttt2x': 'config/lact_l18_d768_ttt2x.yaml',
         }
         # Default SLURM settings
         self.slurm_defaults = {
@@ -230,7 +231,7 @@ def main():
     
     # Model/Config selection
     parser.add_argument('--config', 
-                        choices=['lact_l14_d768_ttt2x', 'lact_l24_d768_ttt2x', 'lact_l24_d768_ttt4x', 'lact_l12_d768_ttt2x'],
+                        choices=['lact_l14_d768_ttt2x', 'lact_l24_d768_ttt2x', 'lact_l24_d768_ttt4x', 'lact_l12_d768_ttt2x', 'lact_l18_d768_ttt2x'],
                         default='lact_l24_d768_ttt2x',
                         help='Model configuration to use')
     
