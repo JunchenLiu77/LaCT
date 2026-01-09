@@ -116,6 +116,10 @@ class Generator:
                 base += f" --image_size {args.image_size[0]} {args.image_size[1]}"
             if args.scene_pose_normalize:
                 base += " --scene_pose_normalize"
+            if args.fdist_min is not None:
+                base += f" --fdist_min {args.fdist_min}"
+            if args.fdist_max is not None:
+                base += f" --fdist_max {args.fdist_max}"
             if args.lr is not None:
                 base += f" --lr {args.lr}"
             if args.warmup is not None:
@@ -276,6 +280,10 @@ def main():
                         help='Batch size per GPU')
     parser.add_argument('--scene-pose-normalize', action='store_true',
                         help='Normalize scene poses')
+    parser.add_argument('--fdist-min', type=int,
+                        help='Minimum frame index (None = start of video)')
+    parser.add_argument('--fdist-max', type=int,
+                        help='Maximum frame index (None = end of video)')
     parser.add_argument('--lr', type=float,
                         help='Learning rate')
     parser.add_argument('--warmup', type=int,

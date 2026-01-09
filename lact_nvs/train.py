@@ -45,6 +45,8 @@ def main():
     parser.add_argument("--num_target_views", type=int, default=8)  
     parser.add_argument("--image_size", nargs=2, type=int, default=[256, 256], help="Image size H, W")
     parser.add_argument("--scene_pose_normalize", action="store_true")
+    parser.add_argument("--fdist_min", type=int, default=None, help="Minimum frame index (None = start of video)")
+    parser.add_argument("--fdist_max", type=int, default=None, help="Maximum frame index (None = end of video)")
 
     # Inference
     parser.add_argument("--test_every", type=int, default=-1, help="Test every N iterations")
@@ -200,7 +202,7 @@ def main():
         return new_state_dict
 
     # Data
-    train_set = NVSDataset("data_example/dl3dv_10k_sample_data_path.json", args.num_all_views, tuple(args.image_size), scene_pose_normalize=args.scene_pose_normalize)
+    train_set = NVSDataset("data_example/dl3dv_10k_sample_data_path.json", args.num_all_views, tuple(args.image_size), scene_pose_normalize=args.scene_pose_normalize, fdist_min=args.fdist_min, fdist_max=args.fdist_max)
     train_sampler = DistributedSampler(train_set)
     train_loader = DataLoader(
         train_set,

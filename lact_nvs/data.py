@@ -93,16 +93,22 @@ class NVSDataset(Dataset):
         sorted_indices=False, 
         scene_pose_normalize=False,
         fixed_indices=None,
+        fdist_min=None,
+        fdist_max=None,
     ):
         """
         image_size is (h, w) or just a int (as size).
         fixed_indices: optional dict {scene_name: [indices...]} to override selection logic.
+        fdist_min: minimum frame index (None = start of video, i.e. 0)
+        fdist_max: maximum frame index (None = end of video, i.e. total_frames)
         """
         self.base_dir = os.path.dirname(data_path)
         self.data_point_paths = json.load(open(data_path, "r"))
         self.sorted_indices = sorted_indices
         self.scene_pose_normalize = scene_pose_normalize
         self.fixed_indices = fixed_indices
+        self.fdist_min = fdist_min
+        self.fdist_max = fdist_max
 
         # filter out the scenes that have less than num_views images
         original_num_scenes = len(self.data_point_paths)
@@ -137,10 +143,10 @@ class NVSDataset(Dataset):
             # indices = self.fixed_indices[scene_name]
 
             # use Long-LRM input indices
-            input_indices = self.fixed_indices[index][f"fold_8_kmeans_{self.num_views // 2}_input"]
+            input_indices = self.fixed_indices[index][f"fold_8_kmeans_{((self.num_views + 1) // 2)}_input"]
             
             # Uniformly select target indices from the all views
-            num_targets = self.num_views // 2
+            num_targets = (self.num_views + 1) // 2
             total_views = len(images_info)
             step = total_views // num_targets
             target_indices = [int(i * step + step // 2) for i in range(num_targets)]
@@ -152,7 +158,19 @@ class NVSDataset(Dataset):
                  indices = sorted(indices)
         else:
             # If the num_views is larger than the number of images, use all images
-            indices = random.sample(range(len(images_info)), min(self.num_views, len(images_info)))
+            # Sample from a subsection of the video based on fdist_min and fdist_max
+            total_frames = len(images_info)
+            fdist_min = self.fdist_min if self.fdist_min is not None else 0
+            fdist_max = self.fdist_max if self.fdist_max is not None else total_frames
+            # Ensure fdist is at least num_views so we can sample enough frames
+            fdist_min = max(fdist_min, self.num_views)
+            fdist_max = max(fdist_max, self.num_views)
+            fdist = random.randint(fdist_min, fdist_max)
+            if total_frames < fdist:
+                return self.__getitem__((index + 1) % len(self.data_point_paths))
+            start_idx = random.randint(0, total_frames - fdist)
+            end_idx = start_idx + fdist
+            indices = random.sample(range(start_idx, end_idx), self.num_views)
             if self.sorted_indices:
                 indices = sorted(indices)
         
