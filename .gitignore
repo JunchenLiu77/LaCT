@@ -49,6 +49,7 @@ dist/
 .eggs/
 
 **/data_example/dl3dv_*
+**/data_example/re10k_*
 weight/
 output/
 
