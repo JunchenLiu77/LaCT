@@ -17,7 +17,7 @@ from transformers.optimization import get_cosine_schedule_with_warmup
 import wandb
 import time
 
-from data import NVSDataset
+from data import NVSDataset, Re10kNVSDataset
 from model import LaCTLVSM
 from inference import get_turntable_cameras_with_zoom_in, get_interpolated_cameras
 from PIL import Image
@@ -31,6 +31,7 @@ def main():
     parser.add_argument("--expname", type=str, default="default")
     parser.add_argument("--load", type=str, default=None)
     parser.add_argument("--data_path", type=str, default="data_example/gso_sample_data_path.json")
+    parser.add_argument("--test_data_path", type=str, default=None, help="Path to test dataset (if different from train)")
     parser.add_argument("--save_every", type=int, default=1000)
     parser.add_argument("--log_every", type=int, default=100)
     parser.add_argument("--seed", type=int, default=95)
@@ -47,10 +48,13 @@ def main():
     parser.add_argument("--scene_pose_normalize", action="store_true")
     parser.add_argument("--fdist_min", type=int, default=None, help="Minimum frame index (None = start of video)")
     parser.add_argument("--fdist_max", type=int, default=None, help="Maximum frame index (None = end of video)")
+    parser.add_argument("--dataset_type", type=str, default="dl3dv", choices=["dl3dv", "re10k"], help="Dataset type: dl3dv or re10k")
+    parser.add_argument("--target_has_input", action="store_true", default=True, help="[Re10k] Whether target views can overlap with input views")
+    parser.add_argument("--no_target_has_input", action="store_false", dest="target_has_input", help="[Re10k] Target views cannot overlap with input views")
 
     # Inference
     parser.add_argument("--test_every", type=int, default=-1, help="Test every N iterations")
-    parser.add_argument("--first_n", type=int, default=None)
+    parser.add_argument("--first_n", type=int, default=None, help="Number of test batches per GPU rank (total scenes = first_n * bs * num_gpus)")
     parser.add_argument("--test_bs_per_gpu", type=int, default=1)
     parser.add_argument("--scene_inference", action="store_true")
 
@@ -201,8 +205,28 @@ def main():
             new_state_dict[key] = value
         return new_state_dict
 
-    # Data
-    train_set = NVSDataset("data_example/dl3dv_10k_sample_data_path.json", args.num_all_views, tuple(args.image_size), scene_pose_normalize=args.scene_pose_normalize, fdist_min=args.fdist_min, fdist_max=args.fdist_max)
+    # Data - Select dataset class based on dataset_type
+    if args.dataset_type == "re10k":
+        train_set = Re10kNVSDataset(
+            data_path=args.data_path,
+            num_input_views=args.num_input_views,
+            num_target_views=args.num_target_views,
+            image_size=tuple(args.image_size),
+            inference=False,
+            scene_pose_normalize=args.scene_pose_normalize,
+            min_frame_dist=args.fdist_min if args.fdist_min is not None else 25,
+            max_frame_dist=args.fdist_max if args.fdist_max is not None else 192,
+            target_has_input=args.target_has_input,
+        )
+    else:
+        train_set = NVSDataset(
+            data_path=args.data_path, 
+            num_views=args.num_all_views, 
+            image_size=tuple(args.image_size), 
+            scene_pose_normalize=args.scene_pose_normalize, 
+            fdist_min=args.fdist_min, 
+            fdist_max=args.fdist_max
+        )
     train_sampler = DistributedSampler(train_set)
     train_loader = DataLoader(
         train_set,
@@ -223,39 +247,42 @@ def main():
     )
 
     if args.test_every > 0:
-        # Load fixed test indices
-        num_total_needed = args.num_input_views + args.num_target_views
-        # fixed_indices_filename = f"test_indices_in{args.num_input_views}_tar{args.num_target_views}.json"
-        # fixed_indices_path = os.path.join("data_example", fixed_indices_filename)
-        
-        # assert os.path.exists(fixed_indices_path), (
-        #     f"Fixed test indices file not found at {fixed_indices_path}. "
-        #     f"Please run `python lact_nvs/generate_indices.py --data_path {args.data_path} "
-        #     f"--num_input_views {args.num_input_views} --num_target_views {args.num_target_views}` first."
-        # )
-        # use Long-LRM input indices
-        fixed_indices_path = "data_example/dl3dv_fold_8_kmeans_input.json"
-        assert os.path.exists(fixed_indices_path), f"Fixed test indices file not found at {fixed_indices_path}"
-        assert args.num_target_views == args.num_input_views, "we assume the number of target views is the same in dataset."
-        assert args.num_target_views in [16, 32, 64, 128], "input indice file only contains 16, 32, 64, 128 views."
-        
-        if dist.get_rank() == 0:
-            print(f"Loading fixed test indices from {fixed_indices_path}")
+        # Create test dataset based on dataset type
+        if args.dataset_type == "re10k":
+            # Re10k uses evaluation_index_re10k.json for inference
+            # Indices file only support 2 input views and 3 target views
+            test_set = Re10kNVSDataset(
+                data_path=args.test_data_path if args.test_data_path else args.data_path.replace('train', 'test'),
+                num_input_views=2,
+                num_target_views=3,
+                image_size=tuple(args.image_size),
+                inference=True,
+                scene_pose_normalize=args.scene_pose_normalize,
+                # target_has_input=args.target_has_input, # testset doesn't have view selection
+                eval_index_path="data_example/evaluation_index_re10k.json",
+            )
+        else:
+            # DL3DV uses Long-LRM input indices
+            fixed_indices_path = "data_example/dl3dv_fold_8_kmeans_input.json"
+            assert os.path.exists(fixed_indices_path), f"Fixed test indices file not found at {fixed_indices_path}"
+            assert args.num_target_views == args.num_input_views, "For DL3DV, we assume the number of target views equals input views."
+            assert args.num_target_views in [16, 32, 64, 128], "DL3DV input indice file only contains 16, 32, 64, 128 views."
             
-        with open(fixed_indices_path, "r") as f:
-            test_indices_map = json.load(f)
+            if dist.get_rank() == 0:
+                print(f"Loading fixed test indices from {fixed_indices_path}")
+                
+            with open(fixed_indices_path, "r") as f:
+                test_indices_map = json.load(f)
 
-        # Use num_total_needed as num_views to ensure we get exactly what we put in the map
-        num_views_for_dataset = args.num_input_views + args.num_target_views
-
-        test_set = NVSDataset(
-            "data_example/dl3dv_benchmark_sample_data_path.json", 
-            num_views_for_dataset, 
-            tuple(args.image_size), 
-            sorted_indices=False,  # Important: false to preserve Input/Target block ordering
-            scene_pose_normalize=args.scene_pose_normalize,
-            fixed_indices=test_indices_map
-        )
+            num_views_for_dataset = args.num_input_views + args.num_target_views
+            test_set = NVSDataset(
+                data_path=args.test_data_path if args.test_data_path else "data_example/dl3dv_benchmark_sample_data_path.json",
+                num_views=num_views_for_dataset, 
+                image_size=tuple(args.image_size), 
+                sorted_indices=False,
+                scene_pose_normalize=args.scene_pose_normalize,
+                fixed_indices=test_indices_map
+            )
         test_sampler = DistributedSampler(test_set)
         test_dataloader_seed_generator = torch.Generator()
         test_dataloader_seed_generator.manual_seed(rank_specific_seed)
@@ -319,6 +346,8 @@ def main():
                 "grad_calc_method": args.grad_calc_method,
                 "no_query": args.no_query,
                 "use_fused": args.use_fused,
+                "dataset_type": args.dataset_type,
+                "data_path": args.data_path,
             },
             resume="allow",
         )
@@ -345,9 +374,9 @@ def main():
                 rank_test_results = []
 
                 for sample_idx, data_dict in enumerate(test_iter):
-                    print(f"[{dist.get_rank():02d}, {ddp_local_rank:02d}] Testing sample {sample_idx:07d}...")
                     if args.first_n is not None and sample_idx >= args.first_n:
                         break
+                    print(f"[{dist.get_rank():02d}, {ddp_local_rank:02d}] Testing sample {sample_idx:07d}...")
                     indices = data_dict["indices"]
                     scene_names = data_dict["scene_name"]
                     data_dict = {key: value.cuda() for key, value in data_dict.items() if isinstance(value, torch.Tensor)}
@@ -374,8 +403,6 @@ def main():
                         batch_size, num_views = rendering.shape[:2]
                         for batch_idx in range(batch_size):
                             scene_name = scene_names[batch_idx]
-                            scene_dir = os.path.join(test_dir, scene_name)
-                            os.makedirs(scene_dir, exist_ok=True)
 
                             # Compute metrics
                             target = target_data_dict["image"][batch_idx]
@@ -411,22 +438,46 @@ def main():
                                 "target_indices": target_indices_original
                             })
 
-                            # Collect all images for this batch
-                            rendered_images = []
-                            target_images = []
-                            for view_idx in range(num_views):
-                                rendered_images.append(tensor_to_numpy(rendered[view_idx]))
-                                target_images.append(tensor_to_numpy(target[view_idx]))
-                            
-                            # Concatenate images horizontally (all views side by side)
-                            target_row = np.concatenate(target_images, axis=1)
-                            rendered_row = np.concatenate(rendered_images, axis=1)
-                            
-                            # Stack rendered and target rows vertically
-                            combined_image = np.concatenate([target_row, rendered_row], axis=0)
-                            
-                            # Save the concatenated image
-                            Image.fromarray(combined_image).save(os.path.join(scene_dir, f"sample_{sample_idx:06d}_batch_{batch_idx:02d}.png"))
+                            # Only save the first scene image in the first batch (one image per rank per test)
+                            if sample_idx == 0 and batch_idx == 0:
+                                # Collect all images for this batch
+                                input_images = []
+                                rendered_images = []
+                                target_images = []
+                                
+                                # Get input images
+                                input_img_tensor = input_data_dict["image"][batch_idx]
+                                for view_idx in range(input_img_tensor.shape[0]):
+                                    input_images.append(tensor_to_numpy(input_img_tensor[view_idx]))
+                                
+                                # Get target and rendered images
+                                for view_idx in range(num_views):
+                                    rendered_images.append(tensor_to_numpy(rendered[view_idx]))
+                                    target_images.append(tensor_to_numpy(target[view_idx]))
+                                
+                                # Concatenate images horizontally (all views side by side)
+                                # Row 1: Input images
+                                # Row 2: Target (GT) images  
+                                # Row 3: Rendered images
+                                input_row = np.concatenate(input_images, axis=1)
+                                target_row = np.concatenate(target_images, axis=1)
+                                rendered_row = np.concatenate(rendered_images, axis=1)
+                                
+                                # Pad input_row to match target_row width if different number of views
+                                if input_row.shape[1] != target_row.shape[1]:
+                                    # Pad with black on the right
+                                    pad_width = target_row.shape[1] - input_row.shape[1]
+                                    if pad_width > 0:
+                                        input_row = np.concatenate([input_row, np.zeros((input_row.shape[0], pad_width, 3), dtype=np.uint8)], axis=1)
+                                    else:
+                                        # Crop if input is wider (unlikely but handle it)
+                                        input_row = input_row[:, :target_row.shape[1], :]
+                                
+                                # Stack all three rows vertically: input, target (GT), rendered
+                                combined_image = np.concatenate([input_row, target_row, rendered_row], axis=0)
+                                
+                                # Save the concatenated image directly in test_dir as scene_name.png
+                                Image.fromarray(combined_image).save(os.path.join(test_dir, f"{scene_name}.png"))
 
                         
                         # Rendering a video to circularly rotate the camera views

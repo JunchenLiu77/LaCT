@@ -33,6 +33,17 @@ class Generator:
             'lact_l12_d768_ttt2x': 'config/lact_l12_d768_ttt2x.yaml',
             'lact_l18_d768_ttt2x': 'config/lact_l18_d768_ttt2x.yaml',
         }
+        # Default data paths for each dataset type
+        self.default_data_paths = {
+            'dl3dv': {
+                'train': 'data_example/dl3dv_10k_sample_data_path.json',
+                'test': 'data_example/dl3dv_benchmark_sample_data_path.json',
+            },
+            're10k': {
+                'train': 'data_example/re10k_preprocessed/train.zip',
+                'test': 'data_example/re10k_preprocessed/test.zip',
+            },
+        }
         # Default SLURM settings
         self.slurm_defaults = {
             'job_name': 'lact',
@@ -60,14 +71,29 @@ class Generator:
         else:
             config_file = args.config
 
+        # Resolve dataset_type and data_path with defaults
+        dataset_type = args.dataset_type or 'dl3dv'
+        if args.data_path:
+            data_path = args.data_path
+        else:
+            # Use default data path based on dataset type and mode (inference vs training)
+            mode = 'test' if args.inference else 'train'
+            data_path = self.default_data_paths[dataset_type][mode]
+        
+        # Resolve test_data_path with defaults
+        if args.test_data_path:
+            test_data_path = args.test_data_path
+        else:
+            test_data_path = self.default_data_paths[dataset_type]['test']
+
         # Prepare command argument string for training/inference
         if args.inference:
             # inference command line
             cmd = f"python inference.py --config {config_file}"
             if args.load:
                 cmd += f" --load {args.load}"
-            if args.data_path:
-                cmd += f" --data_path {args.data_path}"
+            cmd += f" --data_path {data_path}"
+            cmd += f" --dataset_type {dataset_type}"
             if args.expname:
                 cmd += f" --expname '{args.expname}'"
             if args.num_all_views is not None:
@@ -92,8 +118,8 @@ class Generator:
                 base += f" --seed {args.seed}"
             if args.expname:
                 base += f" --expname='{args.expname}'"
-            if args.data_path:
-                base += f" --data_path='{args.data_path}'"
+            base += f" --data_path='{data_path}'"
+            base += f" --dataset_type {dataset_type}"
             if args.load:
                 base += f" --load='{args.load}'"
             if args.save_every is not None:
@@ -120,6 +146,8 @@ class Generator:
                 base += f" --fdist_min {args.fdist_min}"
             if args.fdist_max is not None:
                 base += f" --fdist_max {args.fdist_max}"
+            if not args.target_has_input:
+                base += " --no_target_has_input"
             if args.lr is not None:
                 base += f" --lr {args.lr}"
             if args.warmup is not None:
@@ -132,6 +160,7 @@ class Generator:
                 base += f" --lpips_start {args.lpips_start}"
             if args.test_every is not None:
                 base += f" --test_every {args.test_every}"
+                base += f" --test_data_path='{test_data_path}'"
             if args.test_bs_per_gpu is not None:
                 base += f" --test_bs_per_gpu {args.test_bs_per_gpu}"
             if args.scene_inference:
@@ -250,6 +279,8 @@ def main():
                         help='Checkpoint path to load')
     parser.add_argument('--data-path', type=str,
                         help='Path to dataset JSON file')
+    parser.add_argument('--test-data-path', type=str,
+                        help='Path to test dataset (if different from train)')
     parser.add_argument('--num-all-views', type=int,
                         help='Total number of views')
     parser.add_argument('--num-input-views', type=int,
@@ -261,11 +292,14 @@ def main():
     parser.add_argument('--scene-inference', action='store_true',
                         help='Use scene inference mode')
     parser.add_argument('--first-n', type=int,
-                        help='First N samples to process')
+                        help='Number of test batches per GPU rank (total scenes = first_n * bs * num_gpus)')
     parser.add_argument('--test-bs-per-gpu', type=int,
                         help='Test batch size')
     parser.add_argument('--seed', type=int,
                         help='Seed')
+    parser.add_argument('--dataset-type', type=str, choices=['dl3dv', 're10k'],
+                        default='dl3dv',
+                        help='Dataset type: dl3dv or re10k')
     
     # Training-only arguments
     parser.add_argument('--save-every', type=int,
@@ -284,12 +318,16 @@ def main():
                         help='Minimum frame index (None = start of video)')
     parser.add_argument('--fdist-max', type=int,
                         help='Maximum frame index (None = end of video)')
+    parser.add_argument('--target-has-input', action='store_true', default=True,
+                        help='[Re10k] Target views can overlap with input views (default: True)')
+    parser.add_argument('--no-target-has-input', action='store_false', dest='target_has_input',
+                        help='[Re10k] Target views cannot overlap with input views')
     parser.add_argument('--lr', type=float,
                         help='Learning rate')
     parser.add_argument('--warmup', type=int,
                         help='Warmup steps')
     parser.add_argument('--steps', type=int,
-                        help='Total training steps')
+                        help='Total training steps') 
     parser.add_argument('--weight-decay', type=float,
                         help='Weight decay')
     parser.add_argument('--lpips-start', type=int,
