@@ -1,4 +1,5 @@
 import argparse
+import csv
 import functools
 import math
 import os
@@ -23,6 +24,262 @@ from inference import get_turntable_cameras_with_zoom_in, get_interpolated_camer
 from PIL import Image
 import imageio
 import json
+
+
+def run_evaluation(model, test_loader, lpips_loss_module, args, test_dir, 
+                   first_n=None, save_images=True, ddp_local_rank=0):
+    """
+    Run evaluation on test set.
+    
+    Args:
+        model: The model to evaluate
+        test_loader: DataLoader for test set
+        lpips_loss_module: LPIPS loss module
+        args: Command line arguments
+        test_dir: Directory to save test results
+        first_n: Number of batches per rank to evaluate (None = all)
+        save_images: Whether to save visualization images
+        ddp_local_rank: Local rank for distributed training
+        
+    Returns:
+        List of per-scene results with per-view metrics
+    """
+    os.makedirs(test_dir, exist_ok=True)
+    print(f"[{dist.get_rank():02d}, {ddp_local_rank:02d}] Testing to {test_dir}...")
+
+    # Collect all test results for this rank
+    rank_test_results = []
+    test_iter = iter(test_loader)
+
+    def tensor_to_numpy(tensor):
+        """Convert tensor to numpy RGB image."""
+        numpy_image = tensor.permute(1, 2, 0).cpu().numpy()
+        numpy_image = np.clip(numpy_image * 255, 0, 255).astype(np.uint8)
+        return numpy_image
+
+    for sample_idx, data_dict in enumerate(test_iter):
+        if first_n is not None and sample_idx >= first_n:
+            break
+        print(f"[{dist.get_rank():02d}, {ddp_local_rank:02d}] Testing sample {sample_idx:07d}...")
+        indices = data_dict["indices"]
+        scene_names = data_dict["scene_name"]
+        data_dict = {key: value.cuda() for key, value in data_dict.items() if isinstance(value, torch.Tensor)}
+        
+        # For re10k test, always use 2 input views and 3 target views
+        num_input_views = 2 if args.dataset_type == "re10k" else args.num_input_views
+        num_target_views = 3 if args.dataset_type == "re10k" else args.num_target_views
+        
+        input_data_dict = {key: value[:, :num_input_views] for key, value in data_dict.items()}
+        target_data_dict = {key: value[:, -num_target_views:] for key, value in data_dict.items()}
+
+        with torch.autocast(dtype=torch.bfloat16, device_type="cuda", enabled=True) and torch.no_grad():
+            rendering = model(input_data_dict, target_data_dict)
+
+            batch_size, num_views = rendering.shape[:2]
+            for batch_idx in range(batch_size):
+                scene_name = scene_names[batch_idx]
+
+                # Compute per-view metrics
+                target = target_data_dict["image"][batch_idx]
+                rendered = rendering[batch_idx]
+                
+                # Calculate PSNR per view
+                mse_per_view = F.mse_loss(rendered, target, reduction='none').mean(dim=[1, 2, 3])
+                psnr_per_view = -10.0 * torch.log10(mse_per_view)
+                psnr_per_view_list = psnr_per_view.cpu().tolist()
+                avg_psnr = sum(psnr_per_view_list) / len(psnr_per_view_list)
+
+                # Calculate LPIPS per view
+                lpips_per_view = lpips_loss_module(rendered, target, normalize=True)
+                lpips_per_view_list = lpips_per_view.squeeze().cpu().tolist()
+                if not isinstance(lpips_per_view_list, list):
+                    lpips_per_view_list = [lpips_per_view_list]
+                avg_lpips = sum(lpips_per_view_list) / len(lpips_per_view_list)
+
+                # Determine indices used for input and target
+                sample_indices = indices[batch_idx].cpu().tolist()
+                total_views_count = len(sample_indices)
+                input_indices_local = list(range(num_input_views))
+                target_indices_local = list(range(total_views_count - num_target_views, total_views_count))
+
+                # Map local indices to original dataset indices
+                input_indices_original = [sample_indices[i] for i in input_indices_local]
+                target_indices_original = [sample_indices[i] for i in target_indices_local]
+
+                # Store metrics with per-view details
+                result = {
+                    "scene_name": scene_name,
+                    "input_indices": input_indices_original,
+                    "target_indices": target_indices_original,
+                    "psnr_per_view": psnr_per_view_list,
+                    "lpips_per_view": lpips_per_view_list,
+                    "avg_psnr": avg_psnr,
+                    "avg_lpips": avg_lpips,
+                }
+                rank_test_results.append(result)
+
+                # Only save the first scene image in the first batch (one image per rank per test)
+                if save_images and sample_idx == 0 and batch_idx == 0:
+                    # Collect all images for this batch
+                    input_images = []
+                    rendered_images = []
+                    target_images = []
+                    
+                    # Get input images
+                    input_img_tensor = input_data_dict["image"][batch_idx]
+                    for view_idx in range(input_img_tensor.shape[0]):
+                        input_images.append(tensor_to_numpy(input_img_tensor[view_idx]))
+                    
+                    # Get target and rendered images
+                    for view_idx in range(num_views):
+                        rendered_images.append(tensor_to_numpy(rendered[view_idx]))
+                        target_images.append(tensor_to_numpy(target[view_idx]))
+                    
+                    # Concatenate images horizontally
+                    input_row = np.concatenate(input_images, axis=1)
+                    target_row = np.concatenate(target_images, axis=1)
+                    rendered_row = np.concatenate(rendered_images, axis=1)
+                    
+                    # Pad input_row to match target_row width if different number of views
+                    if input_row.shape[1] != target_row.shape[1]:
+                        pad_width = target_row.shape[1] - input_row.shape[1]
+                        if pad_width > 0:
+                            input_row = np.concatenate([input_row, np.zeros((input_row.shape[0], pad_width, 3), dtype=np.uint8)], axis=1)
+                        else:
+                            input_row = input_row[:, :target_row.shape[1], :]
+                    
+                    # Stack all three rows vertically: input, target (GT), rendered
+                    combined_image = np.concatenate([input_row, target_row, rendered_row], axis=0)
+                    
+                    # Save the concatenated image directly in test_dir as scene_name.png
+                    Image.fromarray(combined_image).save(os.path.join(test_dir, f"{scene_name}.png"))
+
+    torch.cuda.empty_cache()
+    dist.barrier()
+
+    return rank_test_results
+
+
+def aggregate_and_save_results(gathered_results, test_dir, wandb_prefix="test", now_iters=0, 
+                               num_input_views=2, num_target_views=3):
+    """
+    Aggregate results from all ranks and save to CSV.
+    
+    Args:
+        gathered_results: List of results from all ranks
+        test_dir: Directory to save results
+        wandb_prefix: Prefix for wandb logging (e.g., "test" or "final_test")
+        now_iters: Current iteration for wandb logging
+        num_input_views: Number of input views (for CSV header)
+        num_target_views: Number of target views (for CSV header)
+        
+    Returns:
+        Tuple of (avg_psnr, avg_lpips)
+    """
+    # Aggregate all results
+    all_results = []
+    psnr_list = []
+    lpips_list = []
+    # Also collect all per-view metrics for overall average
+    all_psnr_per_view = []
+    all_lpips_per_view = []
+    
+    for rank_results in gathered_results:
+        all_results.extend(rank_results)
+        for res in rank_results:
+            psnr_list.append(res["avg_psnr"])
+            lpips_list.append(res["avg_lpips"])
+            # Collect all per-view metrics
+            all_psnr_per_view.extend(res["psnr_per_view"])
+            all_lpips_per_view.extend(res["lpips_per_view"])
+
+    avg_psnr = np.array(psnr_list, dtype=np.float32).mean()
+    avg_lpips = np.array(lpips_list, dtype=np.float32).mean()
+    
+    # Calculate overall average across all scenes and all views
+    overall_avg_psnr = np.array(all_psnr_per_view, dtype=np.float32).mean()
+    overall_avg_lpips = np.array(all_lpips_per_view, dtype=np.float32).mean()
+    
+    # Calculate per-view averages across all scenes (for the summary row)
+    per_view_avg_psnr = []
+    per_view_avg_lpips = []
+    for view_idx in range(num_target_views):
+        view_psnrs = [res["psnr_per_view"][view_idx] for res in all_results if view_idx < len(res["psnr_per_view"])]
+        view_lpips = [res["lpips_per_view"][view_idx] for res in all_results if view_idx < len(res["lpips_per_view"])]
+        per_view_avg_psnr.append(np.array(view_psnrs, dtype=np.float32).mean() if view_psnrs else 0.0)
+        per_view_avg_lpips.append(np.array(view_lpips, dtype=np.float32).mean() if view_lpips else 0.0)
+    
+    # Build CSV header dynamically based on number of views
+    header = ["scene_name"]
+    for i in range(num_input_views):
+        header.append(f"input_idx{i+1}")
+    for i in range(num_target_views):
+        header.append(f"target_idx{i+1}")
+    for i in range(num_target_views):
+        header.append(f"psnr{i+1}")
+        header.append(f"lpips{i+1}")
+    header.extend(["avg_psnr", "avg_lpips"])
+    
+    # Save results to CSV
+    csv_path = os.path.join(test_dir, "metrics.csv")
+    with open(csv_path, "w", newline="") as f:
+        writer = csv.writer(f)
+        writer.writerow(header)
+        
+        for res in all_results:
+            row = [res["scene_name"]]
+            # Add input indices (pad with empty if fewer than expected)
+            for i in range(num_input_views):
+                if i < len(res["input_indices"]):
+                    row.append(res["input_indices"][i])
+                else:
+                    row.append("")
+            # Add target indices
+            for i in range(num_target_views):
+                if i < len(res["target_indices"]):
+                    row.append(res["target_indices"][i])
+                else:
+                    row.append("")
+            # Add per-view psnr and lpips
+            for i in range(num_target_views):
+                if i < len(res["psnr_per_view"]):
+                    row.append(f"{res['psnr_per_view'][i]:.4f}")
+                else:
+                    row.append("")
+                if i < len(res["lpips_per_view"]):
+                    row.append(f"{res['lpips_per_view'][i]:.4f}")
+                else:
+                    row.append("")
+            # Add averages
+            row.append(f"{res['avg_psnr']:.4f}")
+            row.append(f"{res['avg_lpips']:.4f}")
+            writer.writerow(row)
+        
+        # Add summary row with overall averages
+        summary_row = ["AVERAGE"]
+        # Empty cells for input indices
+        for _ in range(num_input_views):
+            summary_row.append("")
+        # Empty cells for target indices
+        for _ in range(num_target_views):
+            summary_row.append("")
+        # Per-view average PSNR and LPIPS
+        for i in range(num_target_views):
+            summary_row.append(f"{per_view_avg_psnr[i]:.4f}")
+            summary_row.append(f"{per_view_avg_lpips[i]:.4f}")
+        # Overall averages
+        summary_row.append(f"{overall_avg_psnr:.4f}")
+        summary_row.append(f"{overall_avg_lpips:.4f}")
+        writer.writerow(summary_row)
+    
+    # Log to wandb
+    print(f"[{now_iters:07d}] {wandb_prefix} - Average PSNR = {overall_avg_psnr:.2f}, Average LPIPS = {overall_avg_lpips:.4f}, Scenes = {len(all_results)}")
+    wandb.log({
+        f"{wandb_prefix}/psnr": overall_avg_psnr,
+        f"{wandb_prefix}/lpips": overall_avg_lpips,
+    }, step=now_iters)
+    
+    return overall_avg_psnr, overall_avg_lpips
 
 def main():
     parser = argparse.ArgumentParser()
@@ -364,188 +621,38 @@ def main():
     for epoch in range((remaining_steps - 1) // len(train_loader) + 1):
         for data_dict in train_loader:
             if args.test_every > 0 and (now_iters % args.test_every == 0 or now_iters == 0):
-                # instantiate a new data iter each time
-                test_iter = iter(test_loader)
+                # Periodic evaluation during training (respects first_n)
                 test_dir = f"output/{args.expname}/{now_iters:07d}_test"
-                os.makedirs(test_dir, exist_ok=True)
-                print(f"[{dist.get_rank():02d}, {ddp_local_rank:02d}] Testing from iter {now_iters:07d}...")
-
-                # Collect all test results for this rank
-                rank_test_results = []
-
-                for sample_idx, data_dict in enumerate(test_iter):
-                    if args.first_n is not None and sample_idx >= args.first_n:
-                        break
-                    print(f"[{dist.get_rank():02d}, {ddp_local_rank:02d}] Testing sample {sample_idx:07d}...")
-                    indices = data_dict["indices"]
-                    scene_names = data_dict["scene_name"]
-                    data_dict = {key: value.cuda() for key, value in data_dict.items() if isinstance(value, torch.Tensor)}
-                    input_data_dict = {key: value[:, :args.num_input_views] for key, value in data_dict.items()}
-                    target_data_dict = {key: value[:, -args.num_target_views:] for key, value in data_dict.items()}
-
-                    with torch.autocast(dtype=torch.bfloat16, device_type="cuda", enabled=True) and torch.no_grad():
-                        rendering = model(input_data_dict, target_data_dict)
-
-                        # target = target_data_dict["image"]
-                        # psnr = -10.0 * torch.log10(F.mse_loss(rendering, target)).item()
-                        # lpips_loss = lpips_loss_module(rendering.flatten(0, 1), target.flatten(0, 1), normalize=True).mean().item()
-                        # test_psnr_list.append(psnr)
-                        # test_lpips_list.append(lpips_loss)
-                        # print(f"Sample {sample_idx}: PSNR = {psnr:.2f}, LPIPS = {lpips_loss:.4f}")
-                        
-                        # Save rendered images
-                        def tensor_to_numpy(tensor):
-                            """Convert tensor to numpy RGB image."""
-                            numpy_image = tensor.permute(1, 2, 0).cpu().numpy()
-                            numpy_image = np.clip(numpy_image * 255, 0, 255).astype(np.uint8)
-                            return numpy_image
-
-                        batch_size, num_views = rendering.shape[:2]
-                        for batch_idx in range(batch_size):
-                            scene_name = scene_names[batch_idx]
-
-                            # Compute metrics
-                            target = target_data_dict["image"][batch_idx]
-                            rendered = rendering[batch_idx]
-                            
-                            # Calculate PSNR per view and then average (Mean of Metrics), 
-                            # instead of PSNR of average MSE (Metric of Mean Error).
-                            # This aligns with LPIPS calculation and standard evaluation protocols.
-                            mse_per_view = F.mse_loss(rendered, target, reduction='none').mean(dim=[1, 2, 3])
-                            psnr_per_view = -10.0 * torch.log10(mse_per_view)
-                            psnr = psnr_per_view.mean().item()
-
-                            lpips_loss = lpips_loss_module(rendered, target, normalize=True).mean().item()
-
-                            # Determine indices used for input and target
-                            sample_indices = indices[batch_idx].cpu().tolist()
-                            total_views_count = len(sample_indices)
-                            input_indices_local = list(range(args.num_input_views))
-                            target_indices_local = list(range(total_views_count - args.num_target_views, total_views_count))
-
-                            # Map local indices (0..N-1) to original dataset indices
-                            # sample_indices contains the original indices corresponding to positions 0..N-1
-                            # Sort them for the output JSON as requested
-                            input_indices_original = sorted([sample_indices[i] for i in input_indices_local])
-                            target_indices_original = sorted([sample_indices[i] for i in target_indices_local])
-
-                            # Store metrics
-                            rank_test_results.append({
-                                "scene_name": scene_name,
-                                "psnr": psnr,
-                                "lpips": lpips_loss,
-                                "input_indices": input_indices_original,
-                                "target_indices": target_indices_original
-                            })
-
-                            # Only save the first scene image in the first batch (one image per rank per test)
-                            if sample_idx == 0 and batch_idx == 0:
-                                # Collect all images for this batch
-                                input_images = []
-                                rendered_images = []
-                                target_images = []
-                                
-                                # Get input images
-                                input_img_tensor = input_data_dict["image"][batch_idx]
-                                for view_idx in range(input_img_tensor.shape[0]):
-                                    input_images.append(tensor_to_numpy(input_img_tensor[view_idx]))
-                                
-                                # Get target and rendered images
-                                for view_idx in range(num_views):
-                                    rendered_images.append(tensor_to_numpy(rendered[view_idx]))
-                                    target_images.append(tensor_to_numpy(target[view_idx]))
-                                
-                                # Concatenate images horizontally (all views side by side)
-                                # Row 1: Input images
-                                # Row 2: Target (GT) images  
-                                # Row 3: Rendered images
-                                input_row = np.concatenate(input_images, axis=1)
-                                target_row = np.concatenate(target_images, axis=1)
-                                rendered_row = np.concatenate(rendered_images, axis=1)
-                                
-                                # Pad input_row to match target_row width if different number of views
-                                if input_row.shape[1] != target_row.shape[1]:
-                                    # Pad with black on the right
-                                    pad_width = target_row.shape[1] - input_row.shape[1]
-                                    if pad_width > 0:
-                                        input_row = np.concatenate([input_row, np.zeros((input_row.shape[0], pad_width, 3), dtype=np.uint8)], axis=1)
-                                    else:
-                                        # Crop if input is wider (unlikely but handle it)
-                                        input_row = input_row[:, :target_row.shape[1], :]
-                                
-                                # Stack all three rows vertically: input, target (GT), rendered
-                                combined_image = np.concatenate([input_row, target_row, rendered_row], axis=0)
-                                
-                                # Save the concatenated image directly in test_dir as scene_name.png
-                                Image.fromarray(combined_image).save(os.path.join(test_dir, f"{scene_name}.png"))
-
-                        
-                        # Rendering a video to circularly rotate the camera views
-                        # if args.scene_inference:
-                        #     target_cameras = get_interpolated_cameras(
-                        #         cameras=input_data_dict,
-                        #         num_views=2,
-                        #     )
-                        # else:
-                        #     target_cameras = get_turntable_cameras_with_zoom_in(
-                        #         batch_size=1,
-                        #         num_views=120,
-                        #         w=args.image_size[0],
-                        #         h=args.image_size[1],
-                        #         min_radius=1.7,
-                        #         max_radius=3.0,
-                        #         elevation=30,
-                        #         up_vector=np.array([0, 0, 1]),
-                        #         device=torch.device("cuda"),
-                        #     )
-                        # # print(target_cameras["c2w"].shape, target_cameras["fxfycxcy"].shape)
-                        # states = model.module.reconstruct(input_data_dict)
-                        # rendering = model.module.rendering(target_cameras, states, args.image_size[0], args.image_size[1])
-                        # video_path = os.path.join(test_dir, f"sample_{sample_idx:06d}_turntable.gif")
-                        # frames = (rendering[0].permute(0, 2, 3, 1).cpu().numpy() * 255).astype(np.uint8)
-                        # imageio.mimsave(video_path, frames, fps=30, quality=8)
-                        # print(f"Saved turntable video to {video_path}")
                 
-                torch.cuda.empty_cache()
-                dist.barrier()
+                # Determine number of views for test (re10k uses fixed 2 input, 3 target)
+                test_num_input = 2 if args.dataset_type == "re10k" else args.num_input_views
+                test_num_target = 3 if args.dataset_type == "re10k" else args.num_target_views
+                
+                rank_test_results = run_evaluation(
+                    model=model,
+                    test_loader=test_loader,
+                    lpips_loss_module=lpips_loss_module,
+                    args=args,
+                    test_dir=test_dir,
+                    first_n=args.first_n,
+                    save_images=True,
+                    ddp_local_rank=ddp_local_rank,
+                )
 
-                # Collate metrics from all ranks and dump one json only from the main rank
-                # Use dist.all_gather_object to collect results from all ranks
+                # Collate metrics from all ranks
                 gathered_results = [None for _ in range(dist.get_world_size())]
                 dist.all_gather_object(gathered_results, rank_test_results)
 
-                # Compute average metrics at rank 0
+                # Aggregate and save results at rank 0
                 if dist.get_rank() == 0:
-                    # Aggregate all results
-                    all_results = []
-                    psnr_list = []
-                    lpips_list = []
-                    
-                    for rank_results in gathered_results:
-                        all_results.extend(rank_results)
-                        for res in rank_results:
-                            psnr_list.append(res["psnr"])
-                            lpips_list.append(res["lpips"])
-
-                    avg_psnr = np.array(psnr_list, dtype=np.float32).mean()
-                    avg_lpips = np.array(lpips_list, dtype=np.float32).mean()
-                    
-                    # Save aggregated results to metrics.json
-                    final_metrics = {
-                        "average_psnr": float(avg_psnr),
-                        "average_lpips": float(avg_lpips),
-                        "scene_results": all_results
-                    }
-                    
-                    with open(os.path.join(test_dir, "metrics.json"), "w") as f:
-                        json.dump(final_metrics, f, indent=4)
-                    
-                    # log in wandb
-                    print(f"[{now_iters:07d}] Average PSNR = {avg_psnr:.2f}, Average LPIPS = {avg_lpips:.4f}")
-                    wandb.log({
-                        "test/psnr": avg_psnr,
-                        "test/lpips": avg_lpips,
-                    }, step=now_iters)
+                    aggregate_and_save_results(
+                        gathered_results=gathered_results,
+                        test_dir=test_dir,
+                        wandb_prefix="test",
+                        now_iters=now_iters,
+                        num_input_views=test_num_input,
+                        num_target_views=test_num_target,
+                    )
             
             data_dict = {key: value.cuda() for key, value in data_dict.items() if isinstance(value, torch.Tensor)}
             input_data_dict = {key: value[:, :args.num_input_views] for key, value in data_dict.items()}
@@ -621,6 +728,44 @@ def main():
             
             if now_iters == args.steps:
                 break
+
+    # Final evaluation on ALL test scenes after training is complete
+    if args.test_every > 0:
+        print(f"[{dist.get_rank():02d}, {ddp_local_rank:02d}] Running final evaluation on ALL test scenes...")
+        final_test_dir = f"output/{args.expname}/final_test"
+        
+        # Determine number of views for test (re10k uses fixed 2 input, 3 target)
+        test_num_input = 2 if args.dataset_type == "re10k" else args.num_input_views
+        test_num_target = 3 if args.dataset_type == "re10k" else args.num_target_views
+        
+        # Reset test sampler epoch for fresh iteration
+        test_sampler.set_epoch(0)
+        
+        rank_test_results = run_evaluation(
+            model=model,
+            test_loader=test_loader,
+            lpips_loss_module=lpips_loss_module,
+            args=args,
+            test_dir=final_test_dir,
+            first_n=None,  # Evaluate ALL scenes
+            save_images=True,
+            ddp_local_rank=ddp_local_rank,
+        )
+
+        # Collate metrics from all ranks
+        gathered_results = [None for _ in range(dist.get_world_size())]
+        dist.all_gather_object(gathered_results, rank_test_results)
+
+        # Aggregate and save results at rank 0
+        if dist.get_rank() == 0:
+            aggregate_and_save_results(
+                gathered_results=gathered_results,
+                test_dir=final_test_dir,
+                wandb_prefix="final_test",
+                now_iters=now_iters,
+                num_input_views=test_num_input,
+                num_target_views=test_num_target,
+            )
 
     if dist.get_rank() == 0:
         wandb.finish()
