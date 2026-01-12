@@ -58,3 +58,7 @@ wandb/
 
 # uv
 uv.lock
+
+lact_nvs/srun_sub.sh
+lact_nvs/job_script.sh
+lact_nvs/logs/
