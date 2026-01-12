@@ -324,15 +324,20 @@ def fast_weight_swish_glu_weight_norm_mini_batch_apply_fused(
 
     if grad_calc_method == "mannual":
         # manually compute the gradient
-        gate_before_act = ki @ w0_now       # b[b, l, dh] = [b, l, d] @ [b, d, dh]
-        hidden_before_mul = ki @ w2_now     # b[b, l, dh] = [b, l, d] @ [b, d, dh]
-        hidden = F.silu(gate_before_act, inplace=False) * hidden_before_mul
+        if "straight_qk" in ttt_loss_type:
+            # ki as hidden
+            hidden = ki
+        else:
+            gate_before_act = ki @ w0_now       # b[b, l, dh] = [b, l, d] @ [b, d, dh]
+            hidden_before_mul = ki @ w2_now     # b[b, l, dh] = [b, l, d] @ [b, d, dh]
+            hidden = F.silu(gate_before_act, inplace=False) * hidden_before_mul
         vpi = hidden @ w1_now
 
-        if ttt_loss_type in ["dot_product", "ga_dot_product"]:
-            dvpi = -vi
+        if ttt_loss_type == "mse":
+            dvpi = vpi - vi
         else:
-            raise NotImplementedError(f"Unknown ttt_loss_type: {ttt_loss_type}")
+            # by default, use dot-product loss
+            dvpi = -vi
         
         dhidden = dvpi @ w1_now.transpose(-1, -2)  # [b, l, dh] = [b, l, d] @ [b, d, dh]
         dhidden_before_mul = dhidden * F.silu(gate_before_act, inplace=False)
@@ -342,6 +347,10 @@ def fast_weight_swish_glu_weight_norm_mini_batch_apply_fused(
         w1_grad = ((hidden * lr1i).transpose(-1, -2) @ dvpi)
         w0_grad = ((ki * lr0i).transpose(-1, -2) @ dgate_before_act)
         w2_grad = ((ki * lr2i).transpose(-1, -2) @ dhidden_before_mul)
+
+        if "only_w1" in ttt_loss_type:
+            w0_grad *= 0.0
+            w2_grad *= 0.0
 
         if "ga" in ttt_loss_type:
             w1_grad = -w1_grad
@@ -465,28 +474,33 @@ def fast_weight_swish_glu_weight_norm_mini_batch_apply_fused(
     if grad_calc_method not in ["unroll2", "simplify6", "simplify7", "simplify9", "simplify10", "simplify11", "simplify12"]:
         # orthogonalized gradients
         w1_grad = zeropower_via_newtonschulz5(w1_grad, muon_update_steps)
-        w0_grad = zeropower_via_newtonschulz5(w0_grad, muon_update_steps)
-        w2_grad = zeropower_via_newtonschulz5(w2_grad, muon_update_steps)
+        if "only_w1" not in ttt_loss_type:
+            w0_grad = zeropower_via_newtonschulz5(w0_grad, muon_update_steps)
+            w2_grad = zeropower_via_newtonschulz5(w2_grad, muon_update_steps)
 
         w1_now = w1_now - w1_grad
         w0_now = w0_now - w0_grad
         w2_now = w2_now - w2_grad
 
         # do weight norm here
-        w0_now = weight_norm(w0_now, w0_norm)
         w1_now = weight_norm(w1_now, w1_norm)
-        w2_now = weight_norm(w2_now, w2_norm)
+        if "only_w1" not in ttt_loss_type:
+            w0_now = weight_norm(w0_now, w0_norm)
+            w2_now = weight_norm(w2_now, w2_norm)
 
         w0, w1, w2 = w0_now, w1_now, w2_now
 
         # apply
         if no_query:
             # reuse k as q when apply
-            ki = k[:, :num_apply_tokens, :]
-            oi = fast_weight_swish_glu_fwd(ki, w0_now, w1_now, w2_now, inplace=True)
+            mlp_input = k[:, :num_apply_tokens, :]
         else:
-            qi = q[:, :num_apply_tokens, :]
-            oi = fast_weight_swish_glu_fwd(qi, w0_now, w1_now, w2_now, inplace=True)
+            mlp_input = q[:, :num_apply_tokens, :]
+            
+        if "straight_qk" in ttt_loss_type:
+            oi = mlp_input @ w1_now
+        else:
+            oi = fast_weight_swish_glu_fwd(mlp_input, w0_now, w1_now, w2_now, inplace=True)
     output.append(oi)
 
     if VISUALIZE:
