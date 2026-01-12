@@ -16,7 +16,7 @@ uv run torchrun \
     --data_path='data_example/re10k_preprocessed/train.zip' \
     --test_data_path='data_example/re10k_preprocessed/test.zip' \
     --dataset_type re10k \
-    --save_every 500 \
+    --save_every 200 \
     --log_every 10 \
     --actckpt \
     --bs_per_gpu 128 \

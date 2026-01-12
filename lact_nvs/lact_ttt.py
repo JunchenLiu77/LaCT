@@ -349,8 +349,8 @@ def fast_weight_swish_glu_weight_norm_mini_batch_apply_fused(
         w2_grad = ((ki * lr2i).transpose(-1, -2) @ dhidden_before_mul)
 
         if "only_w1" in ttt_loss_type:
-            w0_grad *= 0.0
-            w2_grad *= 0.0
+            w0_grad = w0_grad * 0.0
+            w2_grad = w2_grad * 0.0
 
         if "ga" in ttt_loss_type:
             w1_grad = -w1_grad
