@@ -325,28 +325,36 @@ def fast_weight_swish_glu_weight_norm_mini_batch_apply_fused(
     if grad_calc_method == "mannual":
         # manually compute the gradient
         if "straight_qk" in ttt_loss_type:
-            # ki as hidden
+            # ki as hidden, skip w0 and w2, only use w1
+            # w1 shape: [b, d, d] for straight_qk (not [b, dh, d])
             hidden = ki
+            dvpi = -vi
+
+            w1_grad = ((hidden * lr1i).transpose(-1, -2) @ dvpi)
+            # w0 and w2 are not used in straight_qk
+            assert "only_w1" in ttt_loss_type, "w0 and w2 are not used in straight_qk"
+            w0_grad = torch.zeros_like(w0_now)
+            w2_grad = torch.zeros_like(w2_now)
         else:
             gate_before_act = ki @ w0_now       # b[b, l, dh] = [b, l, d] @ [b, d, dh]
             hidden_before_mul = ki @ w2_now     # b[b, l, dh] = [b, l, d] @ [b, d, dh]
             hidden = F.silu(gate_before_act, inplace=False) * hidden_before_mul
-        vpi = hidden @ w1_now
+            vpi = hidden @ w1_now
 
-        if ttt_loss_type == "mse":
-            dvpi = vpi - vi
-        else:
-            # by default, use dot-product loss
-            dvpi = -vi
-        
-        dhidden = dvpi @ w1_now.transpose(-1, -2)  # [b, l, dh] = [b, l, d] @ [b, d, dh]
-        dhidden_before_mul = dhidden * F.silu(gate_before_act, inplace=False)
-        dgate = dhidden * hidden_before_mul
-        dgate_before_act = silu_backprop(dgate, gate_before_act)
+            if ttt_loss_type == "mse":
+                dvpi = vpi - vi
+            else:
+                # by default, use dot-product loss
+                dvpi = -vi
+            
+            dhidden = dvpi @ w1_now.transpose(-1, -2)  # [b, l, dh] = [b, l, d] @ [b, d, dh]
+            dhidden_before_mul = dhidden * F.silu(gate_before_act, inplace=False)
+            dgate = dhidden * hidden_before_mul
+            dgate_before_act = silu_backprop(dgate, gate_before_act)
 
-        w1_grad = ((hidden * lr1i).transpose(-1, -2) @ dvpi)
-        w0_grad = ((ki * lr0i).transpose(-1, -2) @ dgate_before_act)
-        w2_grad = ((ki * lr2i).transpose(-1, -2) @ dhidden_before_mul)
+            w1_grad = ((hidden * lr1i).transpose(-1, -2) @ dvpi)
+            w0_grad = ((ki * lr0i).transpose(-1, -2) @ dgate_before_act)
+            w2_grad = ((ki * lr2i).transpose(-1, -2) @ dhidden_before_mul)
 
         if "only_w1" in ttt_loss_type:
             w0_grad = w0_grad * 0.0
