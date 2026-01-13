@@ -62,5 +62,6 @@ def fn(
             output.append(oi)
 
     output = torch.cat(output, dim=1)
+    output = output + torch.zeros_like(output) * (w0.sum() + w2.sum())
 
     return output, w0, w1, w2

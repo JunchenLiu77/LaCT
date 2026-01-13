@@ -10,7 +10,7 @@ uv run torchrun \
     --nproc_per_node=$NUM_GPUS \
     --standalone \
     train.py \
-    --config config/lact_l12_d768_ttt2x.yaml \
+    --config config/lact_l12_d768_ttt1x.yaml \
     --seed 77 \
     --expname='re10k_l12_d768_bs512_i2t6_baseline' \
     --data_path='data_example/re10k_preprocessed/train.zip' \
@@ -35,5 +35,4 @@ uv run torchrun \
     --first_n 1 \
     --grad_clip 1.0 \
     --ttt_loss_type='dot_product' \
-    --grad_calc_method='mannual' \
-    --use_fused
+    --grad_calc_method='mannual'

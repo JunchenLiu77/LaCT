@@ -664,7 +664,9 @@ class FastWeightGluMLPMultihead(nn.Module):
         if self.use_fused:
             fn = fast_weight_swish_glu_weight_norm_mini_batch_apply_fused
         else:
-            fn = fast_weight_swish_glu_weight_norm_mini_batch_apply
+            # fn = fast_weight_swish_glu_weight_norm_mini_batch_apply
+            from _lact_ttt import fast_weight_swish_glu_weight_norm_mini_batch_apply as _fast_weight_swish_glu_weight_norm_mini_batch_apply
+            fn = _fast_weight_swish_glu_weight_norm_mini_batch_apply
         output, w0, w1, w2 = fn(
             w0, w1, w2, q, k, v, lr0, lr1, lr2, self.block_idx, info["ttt_op_order"],
             muon_update_steps=self.muon_update_steps,
