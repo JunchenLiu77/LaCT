@@ -30,6 +30,14 @@ def fast_weight_swish_glu_weight_norm_mini_batch_apply(
         from .only_w1 import fn
     elif ttt_loss_type == "only_w1_straight_qk":
         from .only_w1_straight_qk import fn
+    elif ttt_loss_type == "only_w1_straight_qk_no_lr1":
+        from .only_w1_straight_qk_no_lr1 import fn
+    elif ttt_loss_type == "only_w1_straight_qk_no_lr1_no_wn":
+        from .only_w1_straight_qk_no_lr1_no_wn import fn
+    elif ttt_loss_type == "only_w1_straight_qk_no_lr1_no_muon":
+        from .only_w1_straight_qk_no_lr1_no_muon import fn
+    elif ttt_loss_type == "only_w1_straight_qk_no_lr1_no_wn_muon":
+        from .only_w1_straight_qk_no_lr1_no_wn_muon import fn
     else:
         raise NotImplementedError(f"Unknown ttt_loss_type: {ttt_loss_type}")
     return fn(w0, w1, w2, q, k, v, lr0, lr1, lr2, ttt_op_order, muon_update_steps=muon_update_steps)
