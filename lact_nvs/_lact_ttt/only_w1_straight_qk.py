@@ -37,22 +37,13 @@ def fn(
 
         if update:
             ki, vi = k[:, start:end, :], v[:, start:end, :]  # bf16
-            lr0i = lr0[:, start:end, :]  # [b, l, d/1] fp32
             lr1i = lr1[:, start:end, :]  # [b, l, d/1] fp32
-            lr2i = lr2[:, start:end, :]  # [b, l, d/1] fp32
-
-            gate_before_act = ki @ w0_now       # b[b, l, dh] = [b, l, d] @ [b, d, dh]
-            hidden_before_mul = ki @ w2_now     # b[b, l, dh] = [b, l, d] @ [b, d, dh]
-            hidden = F.silu(gate_before_act, inplace=False) * hidden_before_mul
             hidden = ki
             w1_grad = zeropower_via_newtonschulz5(
                 (hidden * lr1i).transpose(-1, -2) @ vi, muon_update_steps
             )
             w1_now = w1_now + w1_grad
-
-            # do weight norm here
             w1_now = w1_now / (w1_now.norm(dim=1, keepdim=True) + 1e-5) * w1_norm
-
             w1 = w1_now
 
         if apply:
