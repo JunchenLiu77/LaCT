@@ -28,6 +28,8 @@ def fast_weight_swish_glu_weight_norm_mini_batch_apply(
         from .ga import fn
     elif ttt_loss_type == "only_w1":
         from .only_w1 import fn
+    elif ttt_loss_type == "only_w1_no_wn":
+        from .only_w1_no_wn import fn
     elif ttt_loss_type == "only_w1_straight_qk":
         from .only_w1_straight_qk import fn
     elif ttt_loss_type == "only_w1_straight_qk_no_lr1":
