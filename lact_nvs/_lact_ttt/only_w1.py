@@ -44,11 +44,6 @@ def fn(
             gate_before_act = ki @ w0_now       # b[b, l, dh] = [b, l, d] @ [b, d, dh]
             hidden_before_mul = ki @ w2_now     # b[b, l, dh] = [b, l, d] @ [b, d, dh]
             hidden = F.silu(gate_before_act, inplace=False) * hidden_before_mul
-
-            dhidden = vi @ w1_now.transpose(-1, -2)  # [b, l, dh] = [b, l, d] @ [b, d, dh]
-            dhidden_before_mul = dhidden * F.silu(gate_before_act, inplace=False)
-            dgate = dhidden * hidden_before_mul
-            dgate_before_act = silu_backprop(dgate, gate_before_act)
             
             w1_grad = zeropower_via_newtonschulz5(
                 (hidden * lr1i).transpose(-1, -2) @ vi, muon_update_steps
