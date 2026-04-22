@@ -1,3 +1,13 @@
+# TTTLA
+
+Experiment code for [Test-Time Training with KV Binding Is Secretly Linear Attention](https://arxiv.org/abs/2602.21204) (TTTLA), built on top of the [LaCT](https://tianyuanzhang.com/projects/ttt-done-right/) codebase.
+
+[[Project Page]](https://research.nvidia.com/labs/sil/projects/tttla/) [[Paper]](https://arxiv.org/abs/2602.21204)
+
+- `lact_llm/` -- Language model experiments (Sec. 4, 6)
+- `lact_nvs/` -- Novel view synthesis experiments (Sec. 4, 6)
+
+---
 
 <p align="center">
 <h1 align="center">LaCT</h1>

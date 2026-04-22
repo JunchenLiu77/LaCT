@@ -47,3 +47,17 @@ build/
 dist/
 *.egg-info/
 .eggs/
+
+**/data_example/re10k_*
+weight/
+output/
+
+# wandb
+wandb/
+
+# uv
+uv.lock
+
+lact_nvs/srun_sub.sh
+lact_nvs/job_script.sh
+lact_nvs/logs/

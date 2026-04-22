@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 import collections
 import math
 
@@ -6,15 +9,16 @@ from torch import nn
 
 import torch.nn.functional as F
 from einops import rearrange
+from _lact_ttt import fast_weight_swish_glu_weight_norm_mini_batch_apply
 
 TTTOperator = collections.namedtuple("TTTOperator", ["start", "end", "update", "apply"])
 
-
+@torch.compile
 def inv_softplus(x):
     y = x + math.log(-math.expm1(-x))
     return y
 
-
+@torch.compile
 def silu_backprop(dy: torch.Tensor, x: torch.Tensor):
     """
     Args:
@@ -27,7 +31,6 @@ def silu_backprop(dy: torch.Tensor, x: torch.Tensor):
     sigma = torch.sigmoid(x)
     dx = dy * sigma * (1 + x * (1 - sigma))
     return dx
-
 
 @torch.compile
 def zeropower_via_newtonschulz5(G, steps):
@@ -67,86 +70,6 @@ def zeropower_via_newtonschulz5(G, steps):
     return X
 
 
-
-def fast_weight_swish_glu_weight_norm_mini_batch_apply(
-    w0: torch.Tensor,
-    w1: torch.Tensor,
-    w2: torch.Tensor,
-    q: torch.Tensor,
-    k: torch.Tensor,
-    v: torch.Tensor,
-    lr0: torch.Tensor,
-    lr1: torch.Tensor,
-    lr2: torch.Tensor,
-    ttt_ua_order: list,
-    muon_update_steps: int = 0,
-):
-    """
-    Note:
-    Forward:
-    (silu(x @ w0) * (x @ w2)) @ w1
-
-    w0, w2: [b, d, dh]
-    w1:     [b, dh, d]
-    q: [b, l, d]
-    k: [b, l, d]
-    v: [b, l, d]
-    lr0, lr1, lr2: [b, l, 1]
-    """
-    w0_norm = w0.detach().norm(dim=1, keepdim=True)
-    w1_norm = w1.detach().norm(dim=1, keepdim=True)
-    w2_norm = w2.detach().norm(dim=1, keepdim=True)
-
-    output = []
-    for start, end, update, apply in ttt_ua_order:
-        w0_now, w1_now, w2_now = w0, w1, w2
-
-        if update:
-            ki, vi = k[:, start:end, :], v[:, start:end, :]  # bf16
-            lr0i = lr0[:, start:end, :]  # [b, l, d/1] fp32
-            lr1i = lr1[:, start:end, :]  # [b, l, d/1] fp32
-            lr2i = lr2[:, start:end, :]  # [b, l, d/1] fp32
-
-            gate_before_act = ki @ w0_now       # b[b, l, dh] = [b, l, d] @ [b, d, dh]
-            hidden_before_mul = ki @ w2_now     # b[b, l, dh] = [b, l, d] @ [b, d, dh]
-            hidden = F.silu(gate_before_act, inplace=False) * hidden_before_mul
-
-            dhidden = vi @ w1_now.transpose(-1, -2)  # [b, l, dh] = [b, l, d] @ [b, d, dh]
-            dhidden_before_mul = dhidden * F.silu(gate_before_act, inplace=False)
-            dgate = dhidden * hidden_before_mul
-            dgate_before_act = silu_backprop(dgate, gate_before_act)
-
-            w1_grad = zeropower_via_newtonschulz5(
-                (hidden * lr1i).transpose(-1, -2) @ vi, muon_update_steps
-            )
-            w0_grad = zeropower_via_newtonschulz5(
-                (ki * lr0i).transpose(-1, -2) @ dgate_before_act, muon_update_steps
-            )
-            w2_grad = zeropower_via_newtonschulz5(
-                (ki * lr2i).transpose(-1, -2) @ dhidden_before_mul, muon_update_steps
-            )
-            w1_now = w1_now + w1_grad
-            w0_now = w0_now + w0_grad
-            w2_now = w2_now + w2_grad
-
-            # do weight norm here
-            w0_now = w0_now / (w0_now.norm(dim=1, keepdim=True) + 1e-5) * w0_norm
-            w1_now = w1_now / (w1_now.norm(dim=1, keepdim=True) + 1e-5) * w1_norm
-            w2_now = w2_now / (w2_now.norm(dim=1, keepdim=True) + 1e-5) * w2_norm
-
-            w0, w1, w2 = w0_now, w1_now, w2_now
-
-        if apply:
-            # Only calculate the output in the last repeat.
-            qi = q[:, start:end, :]
-            oi = (F.silu(qi @ w0_now, inplace=True) * (qi @ w2_now)) @ w1_now
-            output.append(oi)
-
-    output = torch.cat(output, dim=1)
-
-    return output, w0, w1, w2
-
-
 class FastWeightGluMLPMultihead(nn.Module):
     """
     On init of fast_weight:
@@ -171,12 +94,17 @@ class FastWeightGluMLPMultihead(nn.Module):
         bias: bool = False,
         base_lr=0.01,
         muon_update_steps=0,
+        ttt_loss_type="dot_product",
+        no_query: bool = False,
     ):
         super().__init__()
         self.dim = dim
         assert dim % head_dim == 0
         self.num_heads = dim // head_dim
         self.muon_update_steps = muon_update_steps
+        self.ttt_loss_type = ttt_loss_type
+        self.no_query = no_query
+        print(f"TTT Loss type: {ttt_loss_type}, No query: {no_query}")
 
         d_in = d_out = head_dim
         d_h = int(head_dim * inter_multi)
@@ -192,9 +120,8 @@ class FastWeightGluMLPMultihead(nn.Module):
             torch.randn(self.num_heads, d_in, d_h) * gain / math.sqrt(d_in)
         )  # [d_h * num_heads,  d_in]
 
-        self.to_qkv = nn.Linear(dim, 3 * dim, bias=bias)
+        self.to_qkv = nn.Linear(dim, 2 * dim if no_query else 3 * dim, bias=bias)
         self.c_proj = nn.Linear(dim, dim, bias=bias)
-
         self.lr_dim = self.num_heads
         self.lr_fc = nn.Linear(dim, self.lr_dim * 3)
         self.base_lr_inv = inv_softplus(base_lr)
@@ -206,21 +133,31 @@ class FastWeightGluMLPMultihead(nn.Module):
         x: (b, l, d)
         """
         qkv = F.silu(self.to_qkv(x), inplace=True)  # Silu - Linear
-        q, k, v = rearrange(
-            qkv, "b l (qkv h d) -> qkv (b h) l d",
-            qkv=3, h=self.num_heads
-        )
-        q = q / (q.norm(dim=2, keepdim=True) + 1e-5).to(x.dtype)
-        k = k / (k.norm(dim=2, keepdim=True) + 1e-5).to(x.dtype)
+        if self.no_query:
+            q = None
+            k, v = rearrange(
+                qkv, "b l (kv h d) -> kv (b h) l d",
+                kv=2, h=self.num_heads
+            )
+            k = k / (k.norm(dim=2, keepdim=True) + 1e-5).to(x.dtype)
+        else:
+            q, k, v = rearrange(
+                qkv, "b l (qkv h d) -> qkv (b h) l d",
+                qkv=3, h=self.num_heads
+            )
+            q = q / (q.norm(dim=2, keepdim=True) + 1e-5).to(x.dtype)
+            k = k / (k.norm(dim=2, keepdim=True) + 1e-5).to(x.dtype)
 
-        with torch.autocast(device_type="cuda", enabled=False):
-            lr = self.lr_fc(x.float())  # [b, l, lr_dim]
-
-        lr = torch.nn.functional.softplus(lr.float() + self.base_lr_inv)
-        lr0, lr1, lr2 = rearrange(
-            lr, "b l (lrs h d) -> lrs (b h) l d",
-            lrs=3, h=self.num_heads
-        )
+        if self.lr_fc is not None:
+            with torch.autocast(device_type="cuda", enabled=False):
+                lr = self.lr_fc(x.float())  # [b, l, lr_dim]
+            lr = torch.nn.functional.softplus(lr.float() + self.base_lr_inv)
+            lr0, lr1, lr2 = rearrange(
+                lr, "b l (lrs h d) -> lrs (b h) l d",
+                lrs=3, h=self.num_heads
+            )
+        else: 
+            lr0 = lr1 = lr2 = None
 
         if "w0" in info:
             assert "w1" in info and "w2" in info
@@ -235,6 +172,8 @@ class FastWeightGluMLPMultihead(nn.Module):
         output, w0, w1, w2 = fast_weight_swish_glu_weight_norm_mini_batch_apply(
             w0, w1, w2, q, k, v, lr0, lr1, lr2, info["ttt_op_order"],
             muon_update_steps=self.muon_update_steps,
+            ttt_loss_type=self.ttt_loss_type,
+            no_query=self.no_query,
         )
 
         output = self.o_norm(output)
@@ -248,6 +187,8 @@ class FastWeightGluMLPMultihead(nn.Module):
     def extra_repr(self) -> str:
         return (f"w0 shape: {self.w0.shape}, w1 shape: {self.w1.shape}, w2 shape: {self.w2.shape}, "
                 f"Muon update steps: {self.muon_update_steps}, "
-                f"Base lr: {math.log(1 + math.exp(self.base_lr_inv))}, ")
+                f"Base lr: {math.log(1 + math.exp(self.base_lr_inv))}, "
+                f"TTT loss type: {self.ttt_loss_type}, "
+                f"No query: {self.no_query}")
 
 

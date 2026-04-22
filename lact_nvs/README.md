@@ -1,3 +1,40 @@
+# TTTLA -- LaCT NVS Experiments
+
+NVS experiment code for [Test-Time Training with KV Binding Is Secretly Linear Attention](https://arxiv.org/abs/2602.21204) (TTTLA).
+
+[[Project Page]](https://research.nvidia.com/labs/sil/projects/tttla/) [[Paper]](https://arxiv.org/abs/2602.21204)
+
+We show analytically that TTT architectures with key-value binding reduce to learned linear attention operators. This directory contains the NVS experiment implementations used in the paper, including empirical studies (Sec. 4) and the progressive reduction from TTT to linear attention (Sec. 6.1), built on top of the [LaCT](https://tianyuanzhang.com/projects/ttt-done-right/) codebase.
+
+## Experiments and Variants
+
+The `_lact_ttt/` directory contains each TTT inner-loop variant, controlled by the `--ttt_loss_type` and `--no_query` flags passed to `train.py`. The dispatcher in `_lact_ttt/__init__.py` routes to the correct implementation at runtime.
+
+| Name | Script | `ttt_loss_type` | Description |
+|------|--------|-----------------|-------------|
+| Base (LaCT) | `baseline.sh` | `dot_product` (default) | Full SwiGLU TTT with Muon, updates w0/w1/w2 |
+| GA | `ga_dot_product.sh` | `ga_dot_product` | Gradient ascent instead of descent (Sec. 4.2) |
+| No Query | `no_query_dot_product.sh` | `dot_product` + `--no_query` | Replace query with key in output projection (Sec. 4.4) |
+| Variant 1 | `variant1.sh` | `only_w1` | Update only final-layer params w1 (Sec. 6.1) |
+| Variant 2 | `variant2.sh` | `only_w1_no_wn` | Remove weight normalization (Sec. 6.1) |
+| Variant 3 | `variant3.sh` | `only_w1_straight_qk_no_wn` | Replace multi-layer MLP with single linear layer (Sec. 6.1) |
+| Variant 4 | `variant4.sh` | `only_w1_straight_qk_no_lr1_no_wn` | Remove per-token learnable learning rates (Sec. 6.1) |
+| Variant 6 | `variant6.sh` | `only_w1_straight_qk_no_lr1_no_wn_muon` | Remove gradient orthogonalization, reduces to standard linear attention (Sec. 6.1) |
+
+## Launching
+
+Launch scripts are in `scripts/`. Each script trains on RealEstate10K with the `lact_l12_d768_ttt1x` config. For example:
+
+```bash
+bash scripts/re10k_l12_d768_bs512_i2t6_baseline.sh       # Base LaCT
+bash scripts/re10k_l12_d768_bs512_i2t6_ga_dot_product.sh  # Gradient ascent
+bash scripts/re10k_l12_d768_bs512_i2t6_variant1.sh        # Variant 1
+```
+
+See the [Training Script](#training-script) section below for the base LaCT training setup.
+
+---
+
 # LaCT Novel View Synthesis
 
 Code and model release for [LaCT](https://tianyuanzhang.com/projects/ttt-done-right/) (Large-Chunk TTT) novel view synthesis.

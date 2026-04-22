@@ -1,3 +1,38 @@
+# TTTLA -- LaCT LLM Experiments
+
+LLM Experiment code for [Test-Time Training with KV Binding Is Secretly Linear Attention](https://arxiv.org/abs/2602.21204) (TTTLA).
+
+[[Project Page]](https://research.nvidia.com/labs/sil/projects/tttla/) [[Paper]](https://arxiv.org/abs/2602.21204)
+
+We show analytically that TTT architectures with key-value binding reduce to learned linear attention operators. This directory contains the experiment implementations used in the paper, including empirical studies (Sec. 4) and the progressive reduction from TTT to linear attention (Sec. 6.1), built on top of the [LaCT](https://tianyuanzhang.com/projects/ttt-done-right/) codebase.
+
+## Experiments and Variants
+
+The `_ttt_operation_impl/` directory contains each TTT inner-loop variant, controlled by the `ttt_loss_type` field in the model config JSON. The dispatcher in `_ttt_operation_impl/__init__.py` routes to the correct implementation at runtime.
+
+| Name | Config suffix | `ttt_loss_type` | Description |
+|------|--------------|-----------------|-------------|
+| Base (LaCT) | `muon` | `dot_product` (default) | Full SwiGLU TTT with Muon, updates w0/w1/w2 |
+| GA | `ga_dot_product` | `ga_dot_product` | Gradient ascent instead of descent (Sec. 4.2) |
+| No Query | `no_query_dot_product` | `no_query_dot_product` | Replace query with key in output projection (Sec. 4.4) |
+| Variant 1 | `variant1` | `only_w1` | Update only final-layer params w1 (Sec. 6.1) |
+| Variant 2 | `variant2` | `only_w1_no_wn` | Remove weight normalization (Sec. 6.1) |
+| Variant 2 parallel | `variant2_parallel` | `only_w1_no_wn_parallel` | Parallel form of variant 2 (prefix-sum, up to 4x throughput) (Sec. 6.2) |
+| Variant 3 | `variant3` | `only_w1_straight_qk_no_wn` | Replace multi-layer MLP with single linear layer (Sec. 6.1) |
+| Variant 4 | `variant4` | `only_w1_straight_qk_no_lr1_no_wn` | Remove per-token learnable learning rates (Sec. 6.1) |
+| Variant 5 | `variant5` | same as variant 4 | Remove momentum (`use_momentum=false`) (Sec. 6.1) |
+| Variant 6 | `variant6` | same as variant 4 | Remove gradient orthogonalization (`use_muon=false, use_momentum=false`), reduces to standard linear attention (Sec. 6.1) |
+
+Magic string modifiers parsed by the dispatcher:
+- `_no_wn` in `ttt_loss_type` disables weight normalization
+- `_no_lr1` in `ttt_loss_type` disables learned per-token LR (sets LR to 1.0)
+
+## Launching
+
+To run an ablation variant, swap the `--model.config` path to the corresponding config JSON. For example, to run the gradient ascent variant use `configs/760M_lact_swiglu_nh4_fwlow_rank_momentum_muon_ga_dot_product.json`. See the [Training with flame](#training-with-flame) section below for the full launch script.
+
+---
+
 # LaCT Language Model
 
 Code  release for [LaCT](https://tianyuanzhang.com/projects/ttt-done-right/) (Large-Chunk TTT) language model.

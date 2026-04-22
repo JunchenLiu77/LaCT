@@ -1,4 +1,6 @@
 # -*- coding: utf-8 -*-
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
 
 from __future__ import annotations
 
@@ -17,7 +19,8 @@ import torch.nn.functional as F
 import torch.nn as nn
 from einops import rearrange, repeat
 
-from .ttt_operation import block_causal_lact_swiglu, prenorm_block_causal_lact_swiglu, l2_norm
+from .ttt_operation import prenorm_block_causal_lact_swiglu, l2_norm
+from ._ttt_operation_impl import block_causal_lact_swiglu
 
 try:
     from flash_attn import flash_attn_func, flash_attn_varlen_func
@@ -180,14 +183,15 @@ class LaCTSWIGLULayer(nn.Module):
             / math.sqrt(d_h)
         )  # [num_fw_heads, d_out, d_h]
         
-        #### Per-Token LR parameterization. 
-        self.lr_dim = int(lr_dim * 3 * self.num_fw_heads)
-        self.lr_proj = nn.Linear(self.hidden_size, self.lr_dim)
-        base_lr = 0.001
-        # Lr parameterization and initialization
-        if lr_parameterization.lower() == "mamba":
-            self.base_lr_inv = inv_softplus(base_lr)
-        self.lr_parameterization = lr_parameterization
+        #### Per-Token LR parameterization.
+        if ttt_loss_type not in ["only_w1_momentum_one", "only_w1_momentum_one_no_norm"]:
+            self.lr_dim = int(lr_dim * 3 * self.num_fw_heads)
+            self.lr_proj = nn.Linear(self.hidden_size, self.lr_dim)
+            base_lr = 0.001
+            # Lr parameterization and initialization
+            if lr_parameterization.lower() == "mamba":
+                self.base_lr_inv = inv_softplus(base_lr)
+            self.lr_parameterization = lr_parameterization
         
         #### per-channel scaling and offset for Q, and K. 
         self.qk_scale = nn.Parameter(torch.ones(hidden_size, 2))
@@ -202,16 +206,15 @@ class LaCTSWIGLULayer(nn.Module):
         
         self.use_momentum = use_momentum
         if self.use_momentum:
-            self.momentum_proj = nn.Sequential(
-                nn.Linear(hidden_size, self.num_fw_heads),
-                nn.Sigmoid(),
-            )
+            if ttt_loss_type not in ["only_w1_momentum_one", "only_w1_momentum_one_no_norm"]:
+                self.momentum_proj = nn.Sequential(
+                    nn.Linear(hidden_size, self.num_fw_heads),
+                    nn.Sigmoid(),
+                )
 
         self.ttt_loss_type = ttt_loss_type
-        
-        assert self.ttt_loss_type in ["dot_product"], f"Loss type {self.ttt_loss_type} not supported"
+        print(f"TTT loss type: {self.ttt_loss_type}")
 
-        
     def _rescale_qk(self, q, k):
         """
         Args:
@@ -369,17 +372,23 @@ class LaCTSWIGLULayer(nn.Module):
         
         fw_w1 = self.w1.repeat(batch_size, 1, 1) # [nh, d_out, d_h] -> [b*nh, d_out, d_h]
 
-        lr = self.lr_proj(hidden_states) # [b, s, num_heads * lr_dim_per_head]
-        if self.lr_parameterization == "mamba":
-            lr = torch.nn.functional.softplus(lr.float() + self.base_lr_inv)
+        if self.ttt_loss_type not in ["only_w1_momentum_one", "only_w1_momentum_one_no_norm"]:
+            lr = self.lr_proj(hidden_states) # [b, s, num_heads * lr_dim_per_head]
+            if self.lr_parameterization == "mamba":
+                lr = torch.nn.functional.softplus(lr.float() + self.base_lr_inv)
+            else:
+                raise NotImplementedError(f"LR parameterization {self.lr_parameterization} not implemented")
+            fw_lr = rearrange(lr, 'b s (n_h lr_dim) -> (b n_h) s lr_dim', n_h=self.num_fw_heads)
+            fw_lr1, fw_lr2, fw_lr3 = fw_lr.chunk(3, dim=-1)
         else:
-            raise NotImplementedError(f"LR parameterization {self.lr_parameterization} not implemented")
-        fw_lr = rearrange(lr, 'b s (n_h lr_dim) -> (b n_h) s lr_dim', n_h=self.num_fw_heads)
-        fw_lr1, fw_lr2, fw_lr3 = fw_lr.chunk(3, dim=-1)
+            fw_lr1, fw_lr2, fw_lr3 = None, None, None
 
         if self.use_momentum:
-            momentum = self.momentum_proj(hidden_states) # [b, s, nh]
-            momentum = rearrange(momentum, 'b s (n_h d) -> (b n_h) s d', n_h=self.num_fw_heads)
+            if self.ttt_loss_type in ["only_w1_momentum_one", "only_w1_momentum_one_no_norm"]:
+                momentum = 1
+            else:
+                momentum = self.momentum_proj(hidden_states) # [b, s, nh]
+                momentum = rearrange(momentum, 'b s (n_h d) -> (b n_h) s d', n_h=self.num_fw_heads)
         else:
             momentum = None
         
@@ -399,7 +408,8 @@ class LaCTSWIGLULayer(nn.Module):
                 fw_lr1, fw_lr2, fw_lr3,
                 chunk_size=self.lact_chunk_size,
                 use_muon=self.use_muon,
-                momentum=momentum)
+                momentum=momentum,
+                loss_type=self.ttt_loss_type)
         
         # per-head output norm for ttt layer.
         ttt_x_normed = self.ttt_norm(fw_x)
